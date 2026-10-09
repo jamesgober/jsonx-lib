@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "jsonx-lib"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Zero-copy, streaming JSON parser and writer with depth and size budgets; strict RFC 8259, no dependencies."
+description = "Strict RFC 8259 JSON: a borrowing parser, a pull reader, and a deterministic writer, with budgets checked before allocation and no recursion. No dependencies, no_std."
 
 # Keywords (5 max)
 keywords = ["json", "parser", "serialization", "zero-copy", "no-std"]
@@ -51,7 +51,7 @@ std = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# None. jsonx-lib is a leaf of the family: everything it needs is its own.
 
 
 # DEV DEPENDENCIES

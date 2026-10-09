@@ -1,0 +1,409 @@
+//! The writer: deterministic compact and pretty output with complete escaping.
+
+use alloc::{borrow::Cow, string::String};
+use core::{convert::Infallible, fmt, slice};
+
+use crate::{Value, scan, tree::Member};
+
+/// Spaces for indentation, copied in slices.
+const SPACES: &str = "                                                                ";
+
+/// Indentation width of the pretty layout.
+const INDENT: usize = 2;
+
+/// Appends `text` to `out` as a JSON string literal, quotes included.
+///
+/// The escaping is complete and the same every time:
+///
+/// - `"` and `\` are escaped as `\"` and `\\`;
+/// - the control characters U+0000 to U+001F are escaped, with the short forms
+///   `\b \f \n \r \t` where JSON has one and `\u00XX` (lowercase hex)
+///   otherwise;
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped as
+///   `\u2028` and `\u2029`: JSON allows them raw, but JavaScript before ES2019
+///   ends a line at them, so raw ones break JSON embedded in a script;
+/// - everything else, including `/`, DEL, and all other non-ASCII text, is
+///   copied unchanged as UTF-8.
+///
+/// So no string can end the literal early or put a raw line break in it,
+/// whatever it contains: the output is always exactly one JSON string token
+/// that decodes back to `text`. Unescaped stretches are copied in bulk, found
+/// eight bytes at a time.
+///
+/// # Examples
+///
+/// ```
+/// let mut out = String::from("{\"msg\":");
+/// jsonx_lib::write_string(&mut out, "say \"hi\"\n\u{2028}");
+/// out.push('}');
+/// assert_eq!(out, r#"{"msg":"say \"hi\"\n\u2028"}"#);
+/// ```
+pub fn write_string(out: &mut String, text: &str) {
+    out.reserve(text.len() + 2);
+    out.push('"');
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    let mut at = 0;
+    loop {
+        at = scan::find_write_special(bytes, at);
+        let Some(&b) = bytes.get(at) else { break };
+        let escape: &str = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0C => "\\f",
+            0xE2 => match bytes.get(at + 1..at + 3) {
+                Some([0x80, 0xA8]) => "\\u2028",
+                Some([0x80, 0xA9]) => "\\u2029",
+                // Another character starting with 0xE2: copy it as is.
+                _ => {
+                    at += 1;
+                    continue;
+                }
+            },
+            control => {
+                out.push_str(text.get(from..at).unwrap_or(""));
+                out.push_str("\\u00");
+                out.push(char::from(scan::hex_digit(control >> 4)));
+                out.push(char::from(scan::hex_digit(control)));
+                at += 1;
+                from = at;
+                continue;
+            }
+        };
+        out.push_str(text.get(from..at).unwrap_or(""));
+        out.push_str(escape);
+        // The line separators are three bytes; every other escaped byte, one.
+        at += if b == 0xE2 { 3 } else { 1 };
+        from = at;
+    }
+    out.push_str(text.get(from..).unwrap_or(""));
+    out.push('"');
+}
+
+/// Serializes `value` as compact JSON: no whitespace at all.
+///
+/// The output is deterministic: members in their order, numbers as their exact
+/// text, strings escaped as [`write_string`] describes. Parsing it gives back
+/// a value equal to `value`.
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{json, to_string};
+///
+/// let v = json!({ "id": 1, "tags": ["a", "b"], "none": null });
+/// assert_eq!(to_string(&v), r#"{"id":1,"tags":["a","b"],"none":null}"#);
+/// ```
+#[must_use]
+pub fn to_string(value: &Value<'_>) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value);
+    out
+}
+
+/// Serializes `value` as indented JSON: two spaces per level, one member or
+/// item per line, `": "` after keys, empty containers as `[]` and `{}`, and
+/// no trailing newline.
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{json, to_string_pretty};
+///
+/// let v = json!({ "a": [1, 2], "b": {} });
+/// assert_eq!(to_string_pretty(&v), "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {}\n}");
+/// ```
+#[must_use]
+pub fn to_string_pretty(value: &Value<'_>) -> String {
+    let mut out = String::new();
+    write_value_pretty(&mut out, value);
+    out
+}
+
+/// Appends `value` to `out` as compact JSON (see [`to_string`]). Reusing one
+/// buffer across documents avoids an allocation per document.
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{json, write_value};
+///
+/// let mut out = String::from("Content: ");
+/// write_value(&mut out, &json!([true]));
+/// assert_eq!(out, "Content: [true]");
+/// ```
+pub fn write_value(out: &mut String, value: &Value<'_>) {
+    let Ok(()) = emit::<Infallible>(out, value, false, usize::MAX, &mut |_| Ok(()));
+}
+
+/// Appends `value` to `out` as indented JSON (see [`to_string_pretty`]).
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{json, write_value_pretty};
+///
+/// let mut out = String::new();
+/// write_value_pretty(&mut out, &json!([1]));
+/// assert_eq!(out, "[\n  1\n]");
+/// ```
+pub fn write_value_pretty(out: &mut String, value: &Value<'_>) {
+    let Ok(()) = emit::<Infallible>(out, value, true, usize::MAX, &mut |_| Ok(()));
+}
+
+/// Writes `value` as compact JSON to an [`io::Write`](std::io::Write),
+/// through a buffer of a few kilobytes, so a large document is never held as
+/// one string.
+///
+/// # Errors
+///
+/// Any error from `writer`.
+///
+/// # Examples
+///
+/// ```
+/// let mut out = Vec::new();
+/// jsonx_lib::to_writer(&mut out, &jsonx_lib::json!({ "ok": true }))?;
+/// assert_eq!(out, br#"{"ok":true}"#);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub fn to_writer<W: std::io::Write>(writer: W, value: &Value<'_>) -> std::io::Result<()> {
+    write_io(writer, value, false)
+}
+
+/// Writes `value` as indented JSON (see [`to_string_pretty`]) to an
+/// [`io::Write`](std::io::Write), through a buffer of a few kilobytes.
+///
+/// # Errors
+///
+/// Any error from `writer`.
+///
+/// # Examples
+///
+/// ```
+/// let mut out = Vec::new();
+/// jsonx_lib::to_writer_pretty(&mut out, &jsonx_lib::json!([null]))?;
+/// assert_eq!(out, b"[\n  null\n]");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub fn to_writer_pretty<W: std::io::Write>(writer: W, value: &Value<'_>) -> std::io::Result<()> {
+    write_io(writer, value, true)
+}
+
+#[cfg(feature = "std")]
+fn write_io<W: std::io::Write>(
+    mut writer: W,
+    value: &Value<'_>,
+    pretty: bool,
+) -> std::io::Result<()> {
+    const CHUNK: usize = 8 * 1024;
+    let mut buf = String::with_capacity(CHUNK + 256);
+    emit(&mut buf, value, pretty, CHUNK, &mut |chunk: &mut String| {
+        let result = writer.write_all(chunk.as_bytes());
+        chunk.clear();
+        result
+    })?;
+    writer.write_all(buf.as_bytes())
+}
+
+/// Appends a newline and the indentation for `depth` levels.
+fn newline(out: &mut String, depth: usize) {
+    out.push('\n');
+    let mut width = depth.saturating_mul(INDENT);
+    while width > 0 {
+        let chunk = width.min(SPACES.len());
+        out.push_str(SPACES.get(..chunk).unwrap_or(""));
+        width -= chunk;
+    }
+}
+
+/// The children of an open container still to be written.
+enum Open<'r, 'a> {
+    Array(slice::Iter<'r, Value<'a>>),
+    Object(slice::Iter<'r, Member<'a>>),
+}
+
+/// Writes `value` into `out`, handing `out` to `flush` whenever it holds at
+/// least `flush_at` bytes (the flush is expected to empty it).
+///
+/// Iterative: an explicit stack of open containers replaces recursion, so any
+/// depth is safe.
+fn emit<E>(
+    out: &mut String,
+    value: &Value<'_>,
+    pretty: bool,
+    flush_at: usize,
+    flush: &mut dyn FnMut(&mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut stack: alloc::vec::Vec<(Open<'_, '_>, bool)> = alloc::vec::Vec::new();
+    let mut next = Some(value);
+    loop {
+        if let Some(value) = next.take() {
+            match value {
+                Value::Null => out.push_str("null"),
+                Value::Bool(true) => out.push_str("true"),
+                Value::Bool(false) => out.push_str("false"),
+                Value::Number(n) => out.push_str(n.as_str()),
+                Value::String(s) => write_string(out, s),
+                Value::Array(a) if a.is_empty() => out.push_str("[]"),
+                Value::Object(o) if o.is_empty() => out.push_str("{}"),
+                Value::Array(a) => {
+                    out.push('[');
+                    stack.push((Open::Array(a.iter()), true));
+                }
+                Value::Object(o) => {
+                    out.push('{');
+                    stack.push((Open::Object(o.as_slice().iter()), true));
+                }
+            }
+            if out.len() >= flush_at {
+                flush(out)?;
+            }
+        }
+        let depth = stack.len();
+        let Some((open, first)) = stack.last_mut() else {
+            return Ok(());
+        };
+        let (child, key): (Option<&Value<'_>>, Option<&Cow<'_, str>>) = match open {
+            Open::Array(it) => (it.next(), None),
+            Open::Object(it) => match it.next() {
+                Some((k, v)) => (Some(v), Some(k)),
+                None => (None, None),
+            },
+        };
+        let Some(child) = child else {
+            let close = if matches!(open, Open::Array(_)) {
+                ']'
+            } else {
+                '}'
+            };
+            let _closed = stack.pop();
+            if pretty {
+                newline(out, depth - 1);
+            }
+            out.push(close);
+            continue;
+        };
+        if !*first {
+            out.push(',');
+        }
+        *first = false;
+        if pretty {
+            newline(out, depth);
+        }
+        if let Some(key) = key {
+            write_string(out, key);
+            out.push_str(if pretty { ": " } else { ":" });
+        }
+        next = Some(child);
+    }
+}
+
+impl fmt::Display for Value<'_> {
+    /// Writes the value as compact JSON, or as indented JSON with the
+    /// alternate flag (`{:#}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = jsonx_lib::json!({ "a": [1] });
+    /// assert_eq!(format!("{v}"), r#"{"a":[1]}"#);
+    /// assert_eq!(format!("{v:#}"), "{\n  \"a\": [\n    1\n  ]\n}");
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const CHUNK: usize = 4 * 1024;
+        let mut buf = String::new();
+        emit(
+            &mut buf,
+            self,
+            f.alternate(),
+            CHUNK,
+            &mut |chunk: &mut String| {
+                let result = f.write_str(chunk);
+                chunk.clear();
+                result
+            },
+        )?;
+        f.write_str(&buf)
+    }
+}
+
+impl fmt::Debug for Value<'_> {
+    /// Writes the value as compact JSON.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::*;
+
+    fn quoted(text: &str) -> String {
+        let mut out = String::new();
+        write_string(&mut out, text);
+        out
+    }
+
+    #[test]
+    fn test_write_string_escapes_exactly() {
+        assert_eq!(quoted(""), r#""""#);
+        assert_eq!(quoted("plain/text"), r#""plain/text""#);
+        assert_eq!(quoted("\"\\"), r#""\"\\""#);
+        assert_eq!(quoted("\u{8}\u{c}\n\r\t"), r#""\b\f\n\r\t""#);
+        assert_eq!(
+            quoted("\u{0}\u{1}\u{1f}\u{7f}"),
+            "\"\\u0000\\u0001\\u001f\u{7f}\""
+        );
+        assert_eq!(quoted("a\u{2028}b\u{2029}c"), r#""a\u2028b\u2029c""#);
+        // Other characters starting with 0xE2 pass through.
+        assert_eq!(
+            quoted("\u{20ac}\u{2027}\u{202a}"),
+            "\"\u{20ac}\u{2027}\u{202a}\""
+        );
+        assert_eq!(
+            quoted("long run of text then \" quote"),
+            r#""long run of text then \" quote""#
+        );
+    }
+
+    #[test]
+    fn test_pretty_layout_nested_and_empty() {
+        let v = crate::parse(r#"{"a":[],"b":{},"c":[{"d":null}]}"#).unwrap_or_default();
+        assert_eq!(
+            to_string_pretty(&v),
+            "{\n  \"a\": [],\n  \"b\": {},\n  \"c\": [\n    {\n      \"d\": null\n    }\n  ]\n}"
+        );
+        assert_eq!(to_string_pretty(&Value::from(1)), "1");
+    }
+
+    #[test]
+    fn test_display_flushes_in_chunks_identically() {
+        let mut big = String::from("[");
+        for i in 0..5000 {
+            big.push_str(&alloc::format!("{i},"));
+        }
+        big.push_str("0]");
+        let v = crate::parse(&big).unwrap_or_default();
+        assert_eq!(v.to_string(), big);
+    }
+
+    #[test]
+    fn test_deep_indent_beyond_spaces_buffer() {
+        let depth = 40;
+        let text = "[".repeat(depth) + &"]".repeat(depth);
+        let v = crate::parse(&text).unwrap_or_default();
+        let pretty = to_string_pretty(&v);
+        assert!(pretty.contains(&alloc::format!("\n{}[]", " ".repeat((depth - 1) * 2))));
+    }
+}
