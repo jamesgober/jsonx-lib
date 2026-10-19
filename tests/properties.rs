@@ -10,7 +10,7 @@ use common::{
     to_ref,
 };
 use jsonx_lib::{
-    DuplicateKeys, ErrorKind, Event, Limits, Parser, ToJson, Value, ValueWriter, Written,
+    DuplicateKeys, ErrorKind, Event, Format, Limits, Parser, ToJson, Value, ValueWriter, Written,
 };
 use proptest::{prelude::*, sample::Index};
 
@@ -199,6 +199,26 @@ proptest! {
             prop_assert!(jsonx_lib::to_writer_pretty(&mut io, &holder).is_ok());
             prop_assert_eq!(io, jsonx_lib::to_string_pretty(&built).into_bytes());
         }
+    }
+
+    /// Every format writes text that reads back as the same value, under
+    /// both parsers, with the byte property it promises.
+    #[test]
+    fn prop_every_format_round_trips(v in value(), indent in 0u8..9, pretty in any::<bool>(), ascii in any::<bool>(), html in any::<bool>()) {
+        let base = if pretty { Format::compact().with_indent(indent) } else { Format::compact() };
+        let format = base.ascii(ascii).html_safe(html);
+        let text = jsonx_lib::to_string_with(&v, format);
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&text).ok(), Some(v.clone()));
+        prop_assert_eq!(common::parse(text.as_bytes()).result.ok(), Some(to_ref(&v)));
+        if ascii {
+            prop_assert!(text.is_ascii());
+        }
+        if html {
+            prop_assert!(!text.contains(['<', '>', '&']));
+        }
+        // The default formats are the 0.2 layouts.
+        prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::compact()), jsonx_lib::to_string(&v));
+        prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::pretty()), jsonx_lib::to_string_pretty(&v));
     }
 
     /// Clone, equality, and `into_owned` agree with each other.

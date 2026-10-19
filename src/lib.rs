@@ -77,6 +77,7 @@ extern crate alloc;
 mod array;
 mod encode;
 mod error;
+mod format;
 mod lexer;
 mod limits;
 mod machine;
@@ -94,6 +95,7 @@ mod write;
 pub use array::Array;
 pub use encode::{ArrayWriter, ObjectWriter, ToJson, ToJsonKey, ValueWriter, Written};
 pub use error::{Error, ErrorKind};
+pub use format::Format;
 pub use limits::Limits;
 pub use number::Number;
 pub use object::{Iter, IterMut, Object};
@@ -101,9 +103,12 @@ pub use parser::{DuplicateKeys, Parser};
 pub use reader::{Event, Reader};
 pub use stream::{Step, StreamReader};
 pub use value::{Kind, Value};
-pub use write::{to_string, to_string_pretty, write_string, write_value, write_value_pretty};
+pub use write::{
+    to_string, to_string_pretty, to_string_with, write_string, write_value, write_value_pretty,
+    write_value_with,
+};
 #[cfg(feature = "std")]
-pub use write::{to_writer, to_writer_pretty};
+pub use write::{to_writer, to_writer_pretty, to_writer_with};
 
 /// Parses one JSON document with the default [`Limits`], refusing duplicate
 /// keys.

@@ -19,7 +19,7 @@ use alloc::{
 };
 use core::convert::Infallible;
 
-use crate::{Array, Number, Object, Value, number, write};
+use crate::{Array, Format, Number, Object, Value, number, write};
 
 /// Takes the output buffer when it holds enough to pass on.
 pub(crate) trait Flush {
@@ -63,7 +63,7 @@ pub(crate) struct Out<'w> {
     pub(crate) sink: &'w mut dyn Flush,
     /// Hand the buffer to `sink` once it holds this many bytes.
     pub(crate) flush_at: usize,
-    pub(crate) pretty: bool,
+    pub(crate) format: Format,
     pub(crate) depth: usize,
 }
 
@@ -75,7 +75,7 @@ impl Out<'_> {
             buf: &mut *self.buf,
             sink: &mut *self.sink,
             flush_at: self.flush_at,
-            pretty: self.pretty,
+            format: self.format,
             depth,
         }
     }
@@ -279,7 +279,7 @@ impl<'w> ValueWriter<'w> {
     /// ```
     #[inline]
     pub fn str(mut self, value: &str) -> Written {
-        write::write_string(self.out.buf, value);
+        write::write_str(self.out.buf, value, self.out.format);
         self.out.done()
     }
 
@@ -301,10 +301,10 @@ impl<'w> ValueWriter<'w> {
             buf,
             sink,
             flush_at,
-            pretty,
+            format,
             depth,
         } = &mut self.out;
-        let Ok(()) = write::emit::<Infallible>(buf, value, *pretty, *depth, *flush_at, &mut |b| {
+        let Ok(()) = write::emit::<Infallible>(buf, value, *format, *depth, *flush_at, &mut |b| {
             sink.flush(b);
             Ok(())
         });
@@ -400,8 +400,8 @@ impl<'w> ValueWriter<'w> {
     /// Closes a container: on its own line in the pretty layout, unless it
     /// is empty (`[]`, `{}`).
     fn close(mut self, empty: bool, bracket: char) -> Written {
-        if !empty && self.out.pretty {
-            write::newline(self.out.buf, self.out.depth);
+        if !empty && self.out.format.pretty {
+            write::newline(self.out.buf, self.out.depth, self.out.format);
         }
         self.out.buf.push(bracket);
         self.out.done()
@@ -426,13 +426,13 @@ impl ObjectWriter<'_> {
             self.out.buf.push(',');
         }
         self.first = false;
-        if self.out.pretty {
-            write::newline(self.out.buf, self.out.depth);
+        if self.out.format.pretty {
+            write::newline(self.out.buf, self.out.depth, self.out.format);
         }
-        write::write_string(self.out.buf, key);
+        write::write_str(self.out.buf, key, self.out.format);
         self.out
             .buf
-            .push_str(if self.out.pretty { ": " } else { ":" });
+            .push_str(if self.out.format.pretty { ": " } else { ":" });
     }
 
     /// Adds the member `key: value`. An `Option` that is `None` is written as
@@ -543,8 +543,8 @@ impl ArrayWriter<'_> {
         }
         self.first = false;
         let depth = self.out.depth;
-        if self.out.pretty {
-            write::newline(self.out.buf, depth);
+        if self.out.format.pretty {
+            write::newline(self.out.buf, depth, self.out.format);
         }
         ValueWriter::new(self.out.at(depth))
     }
