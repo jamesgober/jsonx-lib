@@ -104,7 +104,8 @@ jobs:
         run: |
           for target in parse reader stream decode write; do
             # The prebuilt cargo-fuzz defaults to musl, which ASan cannot link.
-            cargo fuzz run -O --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -max_len=4096 -rss_limit_mb=2048
+            # Inputs up to 16 KiB: past the stream reader's 4 KiB compaction.
+            cargo fuzz run -O --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -max_len=16384 -rss_limit_mb=2048
           done
 
   coverage:

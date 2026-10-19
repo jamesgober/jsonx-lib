@@ -22,6 +22,19 @@ cargo-fuzz = true
 jsonx-lib     = { path = ".." }
 libfuzzer-sys = "0.4"
 
+# The shared harness tests `cfg(feature = "std")` paths (`to_writer`); the
+# feature is this package's own, on by default, so they are compiled in.
+[features]
+default = ["std"]
+std     = ["jsonx-lib/std"]
+
+# The harness files are shared with the crate's tests and test
+# `cfg(fuzzing)`, which cargo-fuzz sets: declared here too, since the
+# crate's own check-cfg does not reach this package (CI builds with
+# `-D warnings`).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 # Its own workspace: kept out of the crate's builds.
 [workspace]
 members = ["."]
