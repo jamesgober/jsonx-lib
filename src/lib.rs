@@ -60,6 +60,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
+#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
 #![deny(unused_results)]
@@ -70,6 +71,7 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
+#![deny(clippy::unreachable)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate alloc;
