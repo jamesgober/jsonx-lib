@@ -598,7 +598,16 @@ impl Machine {
             }
             b'-' | b'0'..=b'9' => {
                 self.count_value(at)?;
-                self.number(src, at, NumScan::start(at))
+                match lexer::quick_integer(src.as_bytes(), at) {
+                    Some(end) if end - at <= self.limits.max_number_bytes => {
+                        self.pos = end;
+                        self.last = at;
+                        self.after_value();
+                        let text = src.get(at..end).unwrap_or("0");
+                        Ok(Event::Number(Number::from_valid(text)))
+                    }
+                    _ => self.number(src, at, NumScan::start(at)),
+                }
             }
             b't' | b'f' | b'n' => {
                 self.count_value(at)?;

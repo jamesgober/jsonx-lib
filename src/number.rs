@@ -40,6 +40,37 @@ pub struct Number<'a> {
     text: Cow<'a, str>,
 }
 
+/// The value of `text` if it is all ASCII digits (an integer's text, sign
+/// removed) and fits a `u64`; `None` for anything else, a fraction or
+/// exponent included. One pass, with no overflow check below 20 digits.
+#[inline]
+fn digits(text: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0;
+    if text.len() < 20 {
+        if text.is_empty() {
+            return None;
+        }
+        // At most 19 digits: below `u64::MAX`.
+        for &b in text {
+            let digit = b.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + u64::from(digit);
+        }
+        Some(value)
+    } else {
+        for &b in text {
+            let digit = b.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(u64::from(digit))?;
+        }
+        Some(value)
+    }
+}
+
 impl<'a> Number<'a> {
     /// Wraps text the tokenizer has already checked.
     #[inline]
@@ -146,11 +177,11 @@ impl<'a> Number<'a> {
     /// assert_eq!(n("3.0").as_i64(), None); // not an integer's text
     /// ```
     #[must_use]
+    #[inline]
     pub fn as_i64(&self) -> Option<i64> {
-        if self.is_integer() {
-            self.text.parse().ok()
-        } else {
-            None
+        match self.text.strip_prefix('-') {
+            Some(magnitude) => 0i64.checked_sub_unsigned(digits(magnitude.as_bytes())?),
+            None => i64::try_from(digits(self.text.as_bytes())?).ok(),
         }
     }
 
@@ -169,16 +200,14 @@ impl<'a> Number<'a> {
     /// assert_eq!(n("-0").as_u64(), Some(0));
     /// ```
     #[must_use]
+    #[inline]
     pub fn as_u64(&self) -> Option<u64> {
-        if !self.is_integer() {
-            return None;
-        }
         match self.text.strip_prefix('-') {
             // The grammar forbids leading zeros, so `-0` is the only negative
             // integer text with a value `u64` can hold.
             Some("0") => Some(0),
             Some(_) => None,
-            None => self.text.parse().ok(),
+            None => digits(self.text.as_bytes()),
         }
     }
 
@@ -614,6 +643,47 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn test_integer_reads_agree_with_the_standard_parser() {
+        let texts = [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "9",
+            "10",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999",
+            "100000000000000000000",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "1234567890123456789",
+            "12345678901234567890",
+            "-12345678901234567890",
+            "1.0",
+            "1e2",
+            "-1.5",
+            "0.0",
+            "-0e0",
+            "123456789012345678901234567890",
+        ];
+        for text in texts {
+            let n = Number::from_text(text).unwrap();
+            let integer = n.is_integer();
+            let want_i64 = integer.then(|| text.parse::<i64>().ok()).flatten();
+            let want_u64 = match text.strip_prefix('-') {
+                Some("0") => Some(0),
+                Some(_) => None,
+                None => integer.then(|| text.parse::<u64>().ok()).flatten(),
+            };
+            assert_eq!(n.as_i64(), want_i64, "{text}");
+            assert_eq!(n.as_u64(), want_u64, "{text}");
+        }
+    }
 
     fn f(x: f64) -> String {
         format_f64(x).unwrap_or_default()

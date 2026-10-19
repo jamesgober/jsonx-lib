@@ -322,6 +322,33 @@ pub(crate) fn resume_number(
     }
 }
 
+/// The end of the integer starting at `start` (`-?(0|[1-9][0-9]*)`), when
+/// the byte after it ends the number: the common case, decided without the
+/// grammar's state machine. `None` for anything else (a fraction, an
+/// exponent, a leading zero followed by a digit, the end of the text, or no
+/// number at all), which [`resume_number`] then reads, with its errors.
+#[inline(always)]
+pub(crate) fn quick_integer(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    if bytes.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    match bytes.get(i)? {
+        b'0' => i += 1,
+        b'1'..=b'9' => {
+            i += 1;
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        _ => return None,
+    }
+    match bytes.get(i)? {
+        b'.' | b'e' | b'E' | b'0'..=b'9' => None,
+        _ => Some(i),
+    }
+}
+
 /// The number grammar as a resumable state machine; see [`NumState`].
 fn number_text(bytes: &[u8], scan: &mut NumScan, complete: bool) -> Result<usize, Error> {
     let mut i = scan.next;
@@ -395,6 +422,42 @@ mod tests {
     fn kind_at(r: Result<impl core::fmt::Debug, Error>) -> (ErrorKind, usize) {
         let e = r.err().map(|e| (e.kind(), e.offset()));
         e.unwrap_or((ErrorKind::UnexpectedEnd, usize::MAX))
+    }
+
+    #[test]
+    fn test_quick_integer_agrees_with_the_grammar_where_it_answers() {
+        let cases = [
+            "0,",
+            "-0]",
+            "7 ",
+            "42}",
+            "-12345678901234567890,",
+            "01,",
+            "-01 ",
+            "1.5,",
+            "1e3 ",
+            "2E1]",
+            "-,",
+            "- 1",
+            "0",
+            "123",
+            "-",
+            "x",
+            "9.",
+            "0x1,",
+            "00",
+        ];
+        for case in cases {
+            let bytes = case.as_bytes();
+            if let Some(end) = quick_integer(bytes, 0) {
+                assert_eq!(scan_number(bytes, 0, usize::MAX).ok(), Some(end), "{case}");
+            }
+        }
+        assert_eq!(quick_integer(b"42,", 0), Some(2));
+        assert_eq!(quick_integer(b"[-7]", 1), Some(3));
+        assert_eq!(quick_integer(b"42", 0), None); // the end of the text decides
+        assert_eq!(quick_integer(b"01,", 0), None);
+        assert_eq!(quick_integer(b"1.5,", 0), None);
     }
 
     #[test]
