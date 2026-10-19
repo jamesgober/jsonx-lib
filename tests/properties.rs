@@ -237,6 +237,38 @@ proptest! {
         prop_assert_eq!(out, jsonx_lib::to_string_with(&v, format));
     }
 
+    /// `Reader::find_pointer` finds what `Value::pointer` finds, for every
+    /// pointer to a value in the document and some that miss.
+    #[test]
+    fn prop_find_pointer_matches_value_pointer(v in value()) {
+        let text = jsonx_lib::to_string_pretty(&v);
+        // Every path in the value, breadth first, capped.
+        let mut paths = vec![String::new()];
+        let mut i = 0;
+        while i < paths.len() && paths.len() < 64 {
+            let path = paths[i].clone();
+            if let Some(target) = v.pointer(&path) {
+                match target {
+                    Value::Array(a) => paths.extend((0..=a.len()).map(|n| format!("{path}/{n}"))),
+                    Value::Object(o) => {
+                        for key in o.keys() {
+                            paths.push(format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")));
+                        }
+                        paths.push(format!("{path}/no such key"));
+                    }
+                    _ => paths.push(format!("{path}/0")),
+                }
+            }
+            i += 1;
+        }
+        paths.extend(["x", "/~2", "/01"].map(String::from));
+        for path in &paths {
+            let found = GRAMMAR_ONLY.reader(&text).find_pointer(path);
+            let found = found.ok().flatten().and_then(|raw| GRAMMAR_ONLY.parse(raw).ok());
+            prop_assert_eq!(found.as_ref(), v.pointer(path), "{}", path);
+        }
+    }
+
     /// `Hash` agrees with `==`: a value and its round trip hash alike.
     #[test]
     fn prop_hash_agrees_with_eq(v in value()) {

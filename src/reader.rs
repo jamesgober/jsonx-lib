@@ -330,6 +330,79 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Finds the value at an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)
+    /// JSON Pointer in the value that comes next, without building anything,
+    /// and returns its exact source text: what
+    /// [`Value::pointer`](crate::Value::pointer) would find, without the
+    /// tree. Everything before the target is read and validated; members and
+    /// items that are not on the way are skipped with
+    /// [`read_raw`](Self::read_raw). The reader stops just past the target:
+    /// the rest of the document is not read, so call
+    /// [`finish`](Self::finish) to check it too.
+    ///
+    /// `Ok(None)` when the pointer is malformed or names nothing (as
+    /// `Value::pointer`'s `None`); in an object, the first member with the
+    /// key is the one taken.
+    ///
+    /// # Errors
+    ///
+    /// Any error of the reader on the way to the target, or inside it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Reader;
+    ///
+    /// let message = r#"{"jsonrpc": "2.0", "id": 9, "params": {"items": [{"label": "a"}, {"label": "b"}]}}"#;
+    /// assert_eq!(Reader::new(message).find_pointer("/params/items/1/label")?, Some(r#""b""#));
+    /// assert_eq!(Reader::new(message).find_pointer("/id")?, Some("9"));
+    /// assert_eq!(Reader::new(message).find_pointer("/params/missing")?, None);
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    pub fn find_pointer(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
+        if pointer.is_empty() {
+            return self.read_raw();
+        }
+        let Some(rest) = pointer.strip_prefix('/') else {
+            return Ok(None);
+        };
+        for token in rest.split('/') {
+            let Some(token) = crate::value::unescape_pointer_token(token) else {
+                return Ok(None);
+            };
+            match self.peek_kind()? {
+                Some(Kind::Object) => {
+                    let _start = self.next_event()?;
+                    loop {
+                        match self.next_event()? {
+                            Some(Event::Key(key)) if key == token => break,
+                            Some(Event::Key(_)) => {
+                                let _skipped = self.read_raw()?;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                Some(Kind::Array) => {
+                    let Some(index) = crate::value::array_index(&token) else {
+                        return Ok(None);
+                    };
+                    let _start = self.next_event()?;
+                    for _ in 0..index {
+                        if self.read_raw()?.is_none() {
+                            return Ok(None);
+                        }
+                    }
+                    if self.peek_kind()?.is_none() {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        self.read_raw()
+    }
+
     /// Reads to the end of the document, checking that the rest of it is
     /// valid and that nothing but whitespace follows its value.
     ///

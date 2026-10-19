@@ -577,7 +577,7 @@ impl<'a> Value<'a> {
 }
 
 /// Decodes `~1` and `~0` in one JSON Pointer reference token.
-fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
+pub(crate) fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
     if !token.contains('~') {
         return Some(Cow::Borrowed(token));
     }
@@ -598,7 +598,7 @@ fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
 }
 
 /// An RFC 6901 array index: `0`, or a decimal without a leading zero.
-fn array_index(token: &str) -> Option<usize> {
+pub(crate) fn array_index(token: &str) -> Option<usize> {
     let digits = token.as_bytes();
     let canonical = !digits.is_empty()
         && digits.iter().all(u8::is_ascii_digit)
