@@ -78,6 +78,7 @@ mod array;
 mod error;
 mod lexer;
 mod limits;
+mod machine;
 mod macros;
 mod number;
 mod object;

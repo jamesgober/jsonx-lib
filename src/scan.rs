@@ -109,6 +109,17 @@ pub(crate) const fn is_whitespace(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
+/// The index of the first byte at or after `from` that is not JSON
+/// whitespace, or `bytes.len()` if there is none.
+#[inline]
+pub(crate) fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while bytes.get(i).copied().is_some_and(is_whitespace) {
+        i += 1;
+    }
+    i
+}
+
 /// The value of an ASCII hexadecimal digit.
 #[inline(always)]
 pub(crate) const fn hex_value(b: u8) -> Option<u32> {

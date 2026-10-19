@@ -1,0 +1,542 @@
+//! The grammar state machine behind both readers.
+//!
+//! [`Machine`] holds everything a reader knows about where it is in a
+//! document (the grammar state, the open containers, the budgets spent) but
+//! not the text: every step is handed the text to read. [`Reader`](crate::Reader)
+//! hands it the whole document; a reader over input that arrives in pieces
+//! hands it whatever has arrived so far. One machine, so every reader accepts
+//! exactly the same documents with exactly the same errors and offsets.
+//!
+//! Over a complete document, running off the end is
+//! [`ErrorKind::UnexpectedEnd`] at the text's length, as everywhere in the
+//! crate. Over a partial one (`complete == false`) that same error means "the
+//! text so far is fine, send more": the machine first records how far it got
+//! inside the token it was reading ([`Pending`]), so that when more text
+//! arrives the token continues where it stopped instead of being scanned
+//! again from its first byte. A string or a run of whitespace fed one byte
+//! at a time therefore costs linear time, not quadratic.
+
+use alloc::{borrow::Cow, vec::Vec};
+
+use crate::{
+    DuplicateKeys, Limits, Number,
+    error::{Error, ErrorKind},
+    lexer::{self, NumScan, StrScan},
+    reader::Event,
+    scan,
+};
+
+/// What the machine expects next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    /// A value: at the start, or after a member's `:`.
+    Value,
+    /// A value after `,` in an array; `]` here is a trailing comma.
+    Element,
+    /// Just after `[`: a value or `]`.
+    ArrayFirst,
+    /// After an array item: `,` or `]`.
+    ArrayNext,
+    /// Just after `{`: a key or `}`.
+    ObjectFirst,
+    /// After `,` in an object: a key; `}` here is a trailing comma.
+    Key,
+    /// After a member's value: `,` or `}`.
+    ObjectNext,
+    /// The document's value is complete: only whitespace may follow.
+    End,
+    /// The end was reached and reported.
+    Done,
+}
+
+/// Which container is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Container {
+    Array,
+    Object,
+}
+
+/// A token cut off by the end of a partial text, to continue when more
+/// arrives. Value tokens were counted against the element budget when they
+/// started, and are not counted again.
+#[derive(Clone, Copy, Debug)]
+enum Pending {
+    /// Nothing in progress.
+    None,
+    /// A string value whose closing quote has not arrived.
+    Str { quote: usize, scan: StrScan },
+    /// A key whose closing quote has not arrived.
+    Key { quote: usize, scan: StrScan },
+    /// A key read whole, waiting for its `:`; whitespace up to `from` is
+    /// already skipped.
+    Colon {
+        quote: usize,
+        end: usize,
+        escaped: bool,
+        from: usize,
+    },
+    /// A number that reached the end of the text.
+    Num { start: usize, scan: NumScan },
+    /// `true`, `false`, or `null`, cut short (at most four more bytes).
+    Literal { start: usize },
+}
+
+/// The reader's position in the grammar, with its budgets. See the module
+/// documentation.
+#[derive(Clone, Debug)]
+pub(crate) struct Machine {
+    /// The offset just past the input consumed so far.
+    pub(crate) pos: usize,
+    /// Where the most recent event's token began.
+    pub(crate) last: usize,
+    state: State,
+    stack: Vec<Container>,
+    elements: usize,
+    pub(crate) limits: Limits,
+    pub(crate) duplicates: DuplicateKeys,
+    /// Set while a value is skipped: strings are not decoded.
+    pub(crate) skipping: bool,
+    /// Whether the end of the text is the end of the input.
+    pub(crate) complete: bool,
+    pending: Pending,
+}
+
+impl Machine {
+    /// A machine at the start of a document.
+    pub(crate) const fn new(limits: Limits, duplicates: DuplicateKeys, complete: bool) -> Self {
+        Self {
+            pos: 0,
+            last: 0,
+            state: State::Value,
+            stack: Vec::new(),
+            elements: 0,
+            limits,
+            duplicates,
+            skipping: false,
+            complete,
+            pending: Pending::None,
+        }
+    }
+
+    /// The number of arrays and objects open.
+    #[inline]
+    pub(crate) fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Whether the document has been read to its end.
+    #[inline]
+    pub(crate) fn is_done(&self) -> bool {
+        self.state == State::Done
+    }
+
+    /// Marks the document as read to its end, so an iterator over the
+    /// events stops (after it has yielded an error once).
+    #[inline]
+    pub(crate) fn finish_iteration(&mut self) {
+        self.state = State::Done;
+    }
+
+    #[inline]
+    fn end_error(src: &str) -> Error {
+        Error::new(ErrorKind::UnexpectedEnd, src.len())
+    }
+
+    /// Whether `e` means only that a partial text ran out.
+    #[inline]
+    fn cut_short(&self, e: &Error, src: &str) -> bool {
+        !self.complete && e.kind() == ErrorKind::UnexpectedEnd && e.offset() == src.len()
+    }
+
+    /// Records `pending` if `e` only means the text ran out, and passes `e` on.
+    #[inline]
+    fn suspend<T>(&mut self, e: Error, src: &str, pending: Pending) -> Result<T, Error> {
+        if self.cut_short(&e, src) {
+            self.pending = pending;
+        }
+        Err(e)
+    }
+
+    /// Moves past whitespace and a separating `,` and reports whether a value
+    /// comes next, without consuming any token of the value. Over a partial
+    /// text, an answer that depends on bytes not yet there is
+    /// [`ErrorKind::UnexpectedEnd`].
+    pub(crate) fn at_value(&mut self, src: &str) -> Result<bool, Error> {
+        match self.pending {
+            Pending::None => {}
+            Pending::Key { .. } | Pending::Colon { .. } => return Ok(false),
+            _ => return Ok(true),
+        }
+        let bytes = src.as_bytes();
+        self.pos = scan::skip_whitespace(bytes, self.pos);
+        let next = bytes.get(self.pos).copied();
+        Ok(match self.state {
+            State::Value | State::Element => true,
+            State::ArrayFirst => match next {
+                None if !self.complete => return Err(Self::end_error(src)),
+                next => next != Some(b']'),
+            },
+            State::ArrayNext => match next {
+                Some(b',') => {
+                    // Leave the position at the value itself, for `peek_kind`.
+                    self.pos = scan::skip_whitespace(bytes, self.pos + 1);
+                    self.state = State::Element;
+                    true
+                }
+                None if !self.complete => return Err(Self::end_error(src)),
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// Reads the next event from `src`, or `Ok(None)` at the end of the
+    /// document.
+    pub(crate) fn step<'s>(&mut self, src: &'s str) -> Result<Option<Event<'s>>, Error> {
+        if !matches!(self.pending, Pending::None) {
+            return self.resume(src).map(Some);
+        }
+        let bytes = src.as_bytes();
+        loop {
+            self.pos = scan::skip_whitespace(bytes, self.pos);
+            let at = self.pos;
+            let next = bytes.get(at).copied();
+            let err = |kind| Err(Error::new(kind, at));
+            match self.state {
+                State::Value | State::Element | State::ArrayFirst => match next {
+                    None => return Err(Self::end_error(src)),
+                    Some(b']') if self.state == State::ArrayFirst => {
+                        return Ok(Some(self.close(at, Event::EndArray)));
+                    }
+                    Some(b']') if self.state == State::Element => {
+                        return err(ErrorKind::TrailingComma);
+                    }
+                    Some(b) => return self.value(src, b, at).map(Some),
+                },
+                State::ArrayNext => match next {
+                    None => return Err(Self::end_error(src)),
+                    Some(b',') => {
+                        self.pos += 1;
+                        self.state = State::Element;
+                    }
+                    Some(b']') => return Ok(Some(self.close(at, Event::EndArray))),
+                    Some(_) => return err(ErrorKind::ExpectedCommaOrBracket),
+                },
+                State::ObjectFirst | State::Key => match next {
+                    None => return Err(Self::end_error(src)),
+                    Some(b'"') => return self.key(src, at, StrScan::start(at)).map(Some),
+                    Some(b'}') if self.state == State::ObjectFirst => {
+                        return Ok(Some(self.close(at, Event::EndObject)));
+                    }
+                    Some(b'}') => return err(ErrorKind::TrailingComma),
+                    Some(_) => return err(ErrorKind::ExpectedKey),
+                },
+                State::ObjectNext => match next {
+                    None => return Err(Self::end_error(src)),
+                    Some(b',') => {
+                        self.pos += 1;
+                        self.state = State::Key;
+                    }
+                    Some(b'}') => return Ok(Some(self.close(at, Event::EndObject))),
+                    Some(_) => return err(ErrorKind::ExpectedCommaOrBrace),
+                },
+                State::End => {
+                    return match next {
+                        // Over a partial text, whitespace so far proves
+                        // nothing: more input may still follow.
+                        None if !self.complete => Err(Self::end_error(src)),
+                        None => {
+                            self.state = State::Done;
+                            Ok(None)
+                        }
+                        Some(_) => err(ErrorKind::TrailingCharacters),
+                    };
+                }
+                State::Done => return Ok(None),
+            }
+        }
+    }
+
+    /// Continues the token recorded in `pending`.
+    fn resume<'s>(&mut self, src: &'s str) -> Result<Event<'s>, Error> {
+        match core::mem::replace(&mut self.pending, Pending::None) {
+            Pending::None => Err(Self::end_error(src)),
+            Pending::Str { quote, scan } => self.string(src, quote, scan),
+            Pending::Key { quote, scan } => self.key(src, quote, scan),
+            Pending::Colon {
+                quote,
+                end,
+                escaped,
+                from,
+            } => self.colon(src, quote, end, escaped, from),
+            Pending::Num { start, scan } => self.number(src, start, scan),
+            Pending::Literal { start } => self.literal(src, start),
+        }
+    }
+
+    /// The state after a value completes in the current container.
+    #[inline]
+    fn after_value(&mut self) {
+        self.state = match self.stack.last() {
+            None => State::End,
+            Some(Container::Array) => State::ArrayNext,
+            Some(Container::Object) => State::ObjectNext,
+        };
+    }
+
+    /// Closes the innermost container, whose closing byte is at `at`.
+    #[inline]
+    fn close<'s>(&mut self, at: usize, event: Event<'s>) -> Event<'s> {
+        self.pos = at + 1;
+        self.last = at;
+        let _closed = self.stack.pop();
+        self.after_value();
+        event
+    }
+
+    /// Counts one more value, refusing it if the budget is spent.
+    #[inline]
+    fn count_value(&mut self, at: usize) -> Result<(), Error> {
+        if self.elements >= self.limits.max_elements {
+            return Err(Error::new(ErrorKind::TooManyElements, at));
+        }
+        self.elements += 1;
+        Ok(())
+    }
+
+    /// Reads the value starting with byte `b` at `at`.
+    fn value<'s>(&mut self, src: &'s str, b: u8, at: usize) -> Result<Event<'s>, Error> {
+        match b {
+            b'{' | b'[' => {
+                self.count_value(at)?;
+                if self.stack.len() >= self.limits.max_depth {
+                    return Err(Error::new(ErrorKind::DepthLimitExceeded, at));
+                }
+                self.pos = at + 1;
+                self.last = at;
+                Ok(if b == b'{' {
+                    self.stack.push(Container::Object);
+                    self.state = State::ObjectFirst;
+                    Event::StartObject
+                } else {
+                    self.stack.push(Container::Array);
+                    self.state = State::ArrayFirst;
+                    Event::StartArray
+                })
+            }
+            b'"' => {
+                self.count_value(at)?;
+                self.string(src, at, StrScan::start(at))
+            }
+            b'-' | b'0'..=b'9' => {
+                self.count_value(at)?;
+                self.number(src, at, NumScan::start(at))
+            }
+            b't' | b'f' | b'n' => {
+                self.count_value(at)?;
+                self.literal(src, at)
+            }
+            _ => Err(Error::new(ErrorKind::ExpectedValue, at)),
+        }
+    }
+
+    /// Reads (or continues) the string value whose quote is at `quote`.
+    fn string<'s>(
+        &mut self,
+        src: &'s str,
+        quote: usize,
+        scan: StrScan,
+    ) -> Result<Event<'s>, Error> {
+        let mut scan = scan;
+        match lexer::resume_string(
+            src.as_bytes(),
+            quote,
+            &mut scan,
+            self.limits.max_string_bytes,
+        ) {
+            Ok(token) => {
+                self.pos = token.end;
+                self.last = quote;
+                let text = self.body(src, quote, token.end, token.escaped);
+                self.after_value();
+                Ok(Event::String(text))
+            }
+            Err(e) => self.suspend(e, src, Pending::Str { quote, scan }),
+        }
+    }
+
+    /// Reads (or continues) the key whose quote is at `quote`, and the `:`
+    /// after it.
+    fn key<'s>(&mut self, src: &'s str, quote: usize, scan: StrScan) -> Result<Event<'s>, Error> {
+        let mut scan = scan;
+        match lexer::resume_string(
+            src.as_bytes(),
+            quote,
+            &mut scan,
+            self.limits.max_string_bytes,
+        ) {
+            Ok(token) => self.colon(src, quote, token.end, token.escaped, token.end),
+            Err(e) => self.suspend(e, src, Pending::Key { quote, scan }),
+        }
+    }
+
+    /// Finds the `:` after the key at `quote..end`, looking from `from`.
+    fn colon<'s>(
+        &mut self,
+        src: &'s str,
+        quote: usize,
+        end: usize,
+        escaped: bool,
+        from: usize,
+    ) -> Result<Event<'s>, Error> {
+        let at = scan::skip_whitespace(src.as_bytes(), from);
+        match src.as_bytes().get(at) {
+            Some(b':') => {
+                self.pos = at + 1;
+                self.last = quote;
+                self.state = State::Value;
+                Ok(Event::Key(self.body(src, quote, end, escaped)))
+            }
+            Some(_) => Err(Error::new(ErrorKind::ExpectedColon, at)),
+            None => {
+                let pending = Pending::Colon {
+                    quote,
+                    end,
+                    escaped,
+                    from: at,
+                };
+                self.suspend(Self::end_error(src), src, pending)
+            }
+        }
+    }
+
+    /// Reads (or continues) the number starting at `start`.
+    fn number<'s>(
+        &mut self,
+        src: &'s str,
+        start: usize,
+        scan: NumScan,
+    ) -> Result<Event<'s>, Error> {
+        let mut scan = scan;
+        let max = self.limits.max_number_bytes;
+        match lexer::resume_number(src.as_bytes(), start, &mut scan, self.complete, max) {
+            Ok(end) => {
+                self.pos = end;
+                self.last = start;
+                self.after_value();
+                let text = src.get(start..end).unwrap_or("0");
+                Ok(Event::Number(Number::from_valid(text)))
+            }
+            Err(e) => self.suspend(e, src, Pending::Num { start, scan }),
+        }
+    }
+
+    /// Reads the literal starting at `start` (its first byte is `t`, `f`, or
+    /// `n`).
+    fn literal<'s>(&mut self, src: &'s str, start: usize) -> Result<Event<'s>, Error> {
+        let (word, event): (&[u8], _) = match src.as_bytes().get(start) {
+            Some(b't') => (b"true", Event::Bool(true)),
+            Some(b'f') => (b"false", Event::Bool(false)),
+            _ => (b"null", Event::Null),
+        };
+        match lexer::scan_literal(src.as_bytes(), start, word) {
+            Ok(end) => {
+                self.pos = end;
+                self.last = start;
+                self.after_value();
+                Ok(event)
+            }
+            Err(e) => self.suspend(e, src, Pending::Literal { start }),
+        }
+    }
+
+    /// The contents of the string at `quote..end`: borrowed when it has no
+    /// escapes (or while skipping), decoded otherwise.
+    fn body<'s>(&self, src: &'s str, quote: usize, end: usize, escaped: bool) -> Cow<'s, str> {
+        let body = src.get(quote + 1..end - 1).unwrap_or("");
+        if escaped && !self.skipping {
+            Cow::Owned(lexer::decode(body))
+        } else {
+            Cow::Borrowed(body)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    /// Feeds `text` to a partial machine `chunk` bytes more at a time and
+    /// collects the events, as the stream reader does (without compaction).
+    fn chunked(text: &str, chunk: usize) -> Result<Vec<Event<'static>>, Error> {
+        let mut m = Machine::new(Limits::unlimited(), DuplicateKeys::KeepAll, false);
+        let mut out = Vec::new();
+        let mut have = 0;
+        loop {
+            let src = text.get(..have).unwrap_or(text);
+            match m.step(src) {
+                Ok(Some(e)) => out.push(owned(e)),
+                Ok(None) => return Ok(out),
+                Err(e) if m.cut_short(&e, src) => {
+                    if have == text.len() {
+                        m.complete = true;
+                    }
+                    have = (have + chunk).min(text.len());
+                    while !text.is_char_boundary(have) {
+                        have += 1;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn owned(e: Event<'_>) -> Event<'static> {
+        match e {
+            Event::Key(k) => Event::Key(Cow::Owned(k.into_owned())),
+            Event::String(s) => Event::String(Cow::Owned(s.into_owned())),
+            Event::Number(n) => Event::Number(n.into_owned()),
+            Event::StartObject => Event::StartObject,
+            Event::EndObject => Event::EndObject,
+            Event::StartArray => Event::StartArray,
+            Event::EndArray => Event::EndArray,
+            Event::Bool(b) => Event::Bool(b),
+            Event::Null => Event::Null,
+        }
+    }
+
+    fn whole(text: &str) -> Result<Vec<Event<'static>>, Error> {
+        let mut m = Machine::new(Limits::unlimited(), DuplicateKeys::KeepAll, true);
+        let mut out = Vec::new();
+        while let Some(e) = m.step(text)? {
+            out.push(owned(e));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn test_partial_text_gives_the_same_events_at_every_chunk_size() {
+        let docs = [
+            r#"{"a" : [1, -2.5e3, true, false, null, "x\ny\u00e9\ud83d\ude00"], "b": {}}"#,
+            "  12345  ",
+            "[[], {}, [[]], \"\"]",
+            r#"{"key with spaces"   :   "v"}"#,
+            "[1,]",
+            "{\"a\" 1}",
+            "[tru]",
+            "[1 2]",
+            "-",
+            "\"abc",
+            "[0e]",
+            "nul",
+        ];
+        for doc in docs {
+            let want = whole(doc);
+            for chunk in 1..=doc.len() {
+                assert_eq!(chunked(doc, chunk), want, "{doc:?} in chunks of {chunk}");
+            }
+        }
+    }
+}

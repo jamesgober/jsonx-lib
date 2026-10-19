@@ -1,12 +1,13 @@
 //! The pull reader: a document as a stream of events, without building a tree.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::borrow::Cow;
 use core::iter::FusedIterator;
 
 use crate::{
     DuplicateKeys, Limits, Number, Value,
     error::{Error, ErrorKind},
-    lexer, parser, scan,
+    machine::Machine,
+    parser,
 };
 
 /// One step through a document, from [`Reader::next_event`].
@@ -56,36 +57,6 @@ pub enum Event<'a> {
     Null,
 }
 
-/// What the reader expects next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
-    /// A value: at the start, or after a member's `:`.
-    Value,
-    /// A value after `,` in an array; `]` here is a trailing comma.
-    Element,
-    /// Just after `[`: a value or `]`.
-    ArrayFirst,
-    /// After an array item: `,` or `]`.
-    ArrayNext,
-    /// Just after `{`: a key or `}`.
-    ObjectFirst,
-    /// After `,` in an object: a key; `}` here is a trailing comma.
-    Key,
-    /// After a member's value: `,` or `}`.
-    ObjectNext,
-    /// The document's value is complete: only whitespace may follow.
-    End,
-    /// The end was reached and reported.
-    Done,
-}
-
-/// Which container is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Container {
-    Array,
-    Object,
-}
-
 /// A pull parser: reads a document one [`Event`] at a time, building nothing.
 ///
 /// The reader is the layer every parse in this crate goes through: it checks
@@ -131,17 +102,8 @@ enum Container {
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     src: &'a str,
-    pos: usize,
-    /// Where the most recent event's token began.
-    last: usize,
-    state: State,
-    stack: Vec<Container>,
-    elements: usize,
-    limits: Limits,
-    duplicates: DuplicateKeys,
+    machine: Machine,
     failed: Option<Error>,
-    /// Set while [`Reader::read_raw`] skips a value: strings are not decoded.
-    skipping: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -169,15 +131,8 @@ impl<'a> Reader<'a> {
             .then(|| Error::new(ErrorKind::InputTooLarge, limits.max_input_bytes));
         Self {
             src: text,
-            pos: 0,
-            last: 0,
-            state: State::Value,
-            stack: Vec::new(),
-            elements: 0,
-            limits,
-            duplicates,
+            machine: Machine::new(limits, duplicates, true),
             failed,
-            skipping: false,
         }
     }
 
@@ -205,7 +160,9 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        self.step().inspect_err(|&e| self.failed = Some(e))
+        self.machine
+            .step(self.src)
+            .inspect_err(|&e| self.failed = Some(e))
     }
 
     /// Reads the next value whole and returns its exact source text, without
@@ -242,12 +199,12 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if !self.at_value()? {
+        if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
-        self.skipping = true;
+        self.machine.skipping = true;
         let result = self.skip_value();
-        self.skipping = false;
+        self.machine.skipping = false;
         result.map(Some)
     }
 
@@ -280,10 +237,10 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if !self.at_value()? {
+        if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
-        let duplicates = self.duplicates;
+        let duplicates = self.machine.duplicates;
         parser::build(self, duplicates)
             .inspect_err(|&e| self.failed = Some(e))
             .map(Some)
@@ -326,7 +283,7 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.stack.len()
+        self.machine.depth()
     }
 
     /// The byte offset just past the input consumed so far.
@@ -343,7 +300,7 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn offset(&self) -> usize {
-        self.pos
+        self.machine.pos
     }
 
     /// The byte offset where the most recent event's token began: the quote of
@@ -365,234 +322,25 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn event_offset(&self) -> usize {
-        self.last
+        self.machine.last
     }
 
     // ---- internals -----------------------------------------------------------
 
-    #[inline]
-    fn bytes(&self) -> &'a [u8] {
-        self.src.as_bytes()
-    }
-
-    #[inline]
-    fn skip_whitespace(&mut self) {
-        let bytes = self.bytes();
-        while bytes
-            .get(self.pos)
-            .copied()
-            .is_some_and(scan::is_whitespace)
-        {
-            self.pos += 1;
-        }
-    }
-
-    #[inline]
-    fn end_error(&self) -> Error {
-        Error::new(ErrorKind::UnexpectedEnd, self.src.len())
-    }
-
-    /// Moves past whitespace and a separating `,` and reports whether a value
-    /// comes next, without consuming any token of the value.
-    fn at_value(&mut self) -> Result<bool, Error> {
-        self.skip_whitespace();
-        let next = self.bytes().get(self.pos).copied();
-        Ok(match self.state {
-            State::Value | State::Element => true,
-            State::ArrayFirst => next != Some(b']'),
-            State::ArrayNext if next == Some(b',') => {
-                self.pos += 1;
-                self.state = State::Element;
-                true
-            }
-            _ => false,
-        })
-    }
-
     /// Consumes one whole value (the reader is positioned at it) and returns
     /// its text.
     fn skip_value(&mut self) -> Result<&'a str, Error> {
-        let depth = self.stack.len();
+        let depth = self.machine.depth();
         let first = self.next_event()?;
-        let start = self.last;
+        let start = self.machine.last;
         if matches!(first, Some(Event::StartArray | Event::StartObject)) {
-            while self.stack.len() > depth {
+            while self.machine.depth() > depth {
                 if self.next_event()?.is_none() {
-                    return Err(self.end_error());
+                    return Err(Error::new(ErrorKind::UnexpectedEnd, self.src.len()));
                 }
             }
         }
-        Ok(self.src.get(start..self.pos).unwrap_or(""))
-    }
-
-    /// The state after a value completes in the current container.
-    #[inline]
-    fn after_value(&mut self) {
-        self.state = match self.stack.last() {
-            None => State::End,
-            Some(Container::Array) => State::ArrayNext,
-            Some(Container::Object) => State::ObjectNext,
-        };
-    }
-
-    /// Closes the innermost container, whose closing byte is at `at`.
-    #[inline]
-    fn close(&mut self, at: usize, event: Event<'a>) -> Event<'a> {
-        self.pos = at + 1;
-        self.last = at;
-        let _closed = self.stack.pop();
-        self.after_value();
-        event
-    }
-
-    fn step(&mut self) -> Result<Option<Event<'a>>, Error> {
-        loop {
-            self.skip_whitespace();
-            let at = self.pos;
-            let next = self.bytes().get(at).copied();
-            let err = |kind| Err(Error::new(kind, at));
-            match self.state {
-                State::Value | State::Element | State::ArrayFirst => match next {
-                    None => return Err(self.end_error()),
-                    Some(b']') if self.state == State::ArrayFirst => {
-                        return Ok(Some(self.close(at, Event::EndArray)));
-                    }
-                    Some(b']') if self.state == State::Element => {
-                        return err(ErrorKind::TrailingComma);
-                    }
-                    Some(b) => return self.value(b, at).map(Some),
-                },
-                State::ArrayNext => match next {
-                    None => return Err(self.end_error()),
-                    Some(b',') => {
-                        self.pos += 1;
-                        self.state = State::Element;
-                    }
-                    Some(b']') => return Ok(Some(self.close(at, Event::EndArray))),
-                    Some(_) => return err(ErrorKind::ExpectedCommaOrBracket),
-                },
-                State::ObjectFirst | State::Key => match next {
-                    None => return Err(self.end_error()),
-                    Some(b'"') => return self.key(at).map(Some),
-                    Some(b'}') if self.state == State::ObjectFirst => {
-                        return Ok(Some(self.close(at, Event::EndObject)));
-                    }
-                    Some(b'}') => return err(ErrorKind::TrailingComma),
-                    Some(_) => return err(ErrorKind::ExpectedKey),
-                },
-                State::ObjectNext => match next {
-                    None => return Err(self.end_error()),
-                    Some(b',') => {
-                        self.pos += 1;
-                        self.state = State::Key;
-                    }
-                    Some(b'}') => return Ok(Some(self.close(at, Event::EndObject))),
-                    Some(_) => return err(ErrorKind::ExpectedCommaOrBrace),
-                },
-                State::End => {
-                    return match next {
-                        None => {
-                            self.state = State::Done;
-                            Ok(None)
-                        }
-                        Some(_) => err(ErrorKind::TrailingCharacters),
-                    };
-                }
-                State::Done => return Ok(None),
-            }
-        }
-    }
-
-    /// Counts one more value, refusing it if the budget is spent.
-    #[inline]
-    fn count_value(&mut self, at: usize) -> Result<(), Error> {
-        if self.elements >= self.limits.max_elements {
-            return Err(Error::new(ErrorKind::TooManyElements, at));
-        }
-        self.elements += 1;
-        Ok(())
-    }
-
-    /// Reads the value starting with byte `b` at `at`.
-    fn value(&mut self, b: u8, at: usize) -> Result<Event<'a>, Error> {
-        let bytes = self.bytes();
-        let event = match b {
-            b'{' | b'[' => {
-                self.count_value(at)?;
-                if self.stack.len() >= self.limits.max_depth {
-                    return Err(Error::new(ErrorKind::DepthLimitExceeded, at));
-                }
-                self.pos = at + 1;
-                if b == b'{' {
-                    self.stack.push(Container::Object);
-                    self.state = State::ObjectFirst;
-                    Event::StartObject
-                } else {
-                    self.stack.push(Container::Array);
-                    self.state = State::ArrayFirst;
-                    Event::StartArray
-                }
-            }
-            b'"' => {
-                self.count_value(at)?;
-                Event::String(self.string(at)?)
-            }
-            b'-' | b'0'..=b'9' => {
-                self.count_value(at)?;
-                let end = lexer::scan_number(bytes, at, self.limits.max_number_bytes)?;
-                self.pos = end;
-                self.after_value();
-                Event::Number(Number::from_valid(self.src.get(at..end).unwrap_or("0")))
-            }
-            b't' | b'f' | b'n' => {
-                self.count_value(at)?;
-                let (word, event): (&[u8], _) = match b {
-                    b't' => (b"true", Event::Bool(true)),
-                    b'f' => (b"false", Event::Bool(false)),
-                    _ => (b"null", Event::Null),
-                };
-                self.pos = lexer::scan_literal(bytes, at, word)?;
-                self.after_value();
-                event
-            }
-            _ => return Err(Error::new(ErrorKind::ExpectedValue, at)),
-        };
-        self.last = at;
-        Ok(event)
-    }
-
-    /// Reads the string value whose quote is at `at`.
-    fn string(&mut self, at: usize) -> Result<Cow<'a, str>, Error> {
-        let text = self.string_body(at)?;
-        self.after_value();
-        Ok(text)
-    }
-
-    /// Reads the key whose quote is at `at`, and the `:` after it.
-    fn key(&mut self, at: usize) -> Result<Event<'a>, Error> {
-        let key = self.string_body(at)?;
-        self.skip_whitespace();
-        match self.bytes().get(self.pos) {
-            Some(b':') => self.pos += 1,
-            Some(_) => return Err(Error::new(ErrorKind::ExpectedColon, self.pos)),
-            None => return Err(self.end_error()),
-        }
-        self.state = State::Value;
-        self.last = at;
-        Ok(Event::Key(key))
-    }
-
-    /// Scans the string at `at` and returns its contents: borrowed when it has
-    /// no escapes (or while skipping), decoded otherwise.
-    fn string_body(&mut self, at: usize) -> Result<Cow<'a, str>, Error> {
-        let token = lexer::scan_string(self.bytes(), at, self.limits.max_string_bytes)?;
-        self.pos = token.end;
-        let body = self.src.get(at + 1..token.end - 1).unwrap_or("");
-        Ok(if token.escaped && !self.skipping {
-            Cow::Owned(lexer::decode(body))
-        } else {
-            Cow::Borrowed(body)
-        })
+        Ok(self.src.get(start..self.machine.pos).unwrap_or(""))
     }
 }
 
@@ -602,7 +350,7 @@ impl<'a> Iterator for Reader<'a> {
     /// The next event; after the end or an error, `None`. An error is yielded
     /// once.
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed.is_some() && self.state == State::Done {
+        if self.failed.is_some() && self.machine.is_done() {
             return None;
         }
         match self.next_event() {
@@ -610,7 +358,7 @@ impl<'a> Iterator for Reader<'a> {
             Ok(None) => None,
             Err(e) => {
                 // Yield the error once, then stop.
-                self.state = State::Done;
+                self.machine.finish_iteration();
                 Some(Err(e))
             }
         }
