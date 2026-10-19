@@ -16,10 +16,10 @@
 //! again from its first byte. A string or a run of whitespace fed one byte
 //! at a time therefore costs linear time, not quadratic.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::{
-    DuplicateKeys, Kind, Limits, Number,
+    DuplicateKeys, Kind, Limits, Number, dupes,
     error::{Error, ErrorKind},
     lexer::{self, NumScan, StrScan},
     reader::Event,
@@ -81,8 +81,35 @@ enum Pending {
     Literal { start: usize },
 }
 
+/// One key of an object still open, kept to check for duplicates.
+#[derive(Clone, Copy, Debug)]
+struct KeyEntry {
+    /// The key's opening quote, where a duplicate is reported.
+    quote: usize,
+    /// The decoded key text: `start..start + len` of the arena, or of the
+    /// input text when `in_text`.
+    start: usize,
+    len: usize,
+    in_text: bool,
+}
+
+/// An object still open whose keys are being kept.
+#[derive(Clone, Copy, Debug)]
+struct OpenObject {
+    /// Its first key in `Machine::keys`.
+    keys: usize,
+    /// The arena's length when it opened.
+    arena: usize,
+}
+
 /// The reader's position in the grammar, with its budgets. See the module
 /// documentation.
+///
+/// Under [`DuplicateKeys::Error`] the machine also keeps the keys of every
+/// open object (a slice of the text, or a decoded copy for a key with
+/// escapes) and refuses a repeated key when the object closes, at the
+/// repeat's opening quote: the same check, at the same point, as the tree
+/// builder made in 0.2, now applied to every way of reading.
 #[derive(Clone, Debug)]
 pub(crate) struct Machine {
     /// The offset just past the input consumed so far.
@@ -99,6 +126,13 @@ pub(crate) struct Machine {
     /// Whether the end of the text is the end of the input.
     pub(crate) complete: bool,
     pending: Pending,
+    /// Keep every key in the arena, not as a slice of the text (for a text
+    /// whose front is dropped as it is read).
+    pub(crate) copy_keys: bool,
+    objects: Vec<OpenObject>,
+    keys: Vec<KeyEntry>,
+    arena: String,
+    order: Vec<usize>,
 }
 
 impl Machine {
@@ -115,7 +149,18 @@ impl Machine {
             skipping: false,
             complete,
             pending: Pending::None,
+            copy_keys: false,
+            objects: Vec::new(),
+            keys: Vec::new(),
+            arena: String::new(),
+            order: Vec::new(),
         }
+    }
+
+    /// Whether keys are checked for duplicates.
+    #[inline]
+    fn checks_keys(&self) -> bool {
+        self.duplicates == DuplicateKeys::Error
     }
 
     /// The number of arrays and objects open.
@@ -306,7 +351,7 @@ impl Machine {
                     None => return Err(Self::end_error(src)),
                     Some(b'"') => return self.key(src, at, StrScan::start(at)).map(Some),
                     Some(b'}') if self.state == State::ObjectFirst => {
-                        return Ok(Some(self.close(at, Event::EndObject)));
+                        return self.close_object(src, at).map(Some);
                     }
                     Some(b'}') => return err(ErrorKind::TrailingComma),
                     Some(_) => return err(ErrorKind::ExpectedKey),
@@ -317,7 +362,7 @@ impl Machine {
                         self.pos += 1;
                         self.state = State::Key;
                     }
-                    Some(b'}') => return Ok(Some(self.close(at, Event::EndObject))),
+                    Some(b'}') => return self.close_object(src, at).map(Some),
                     Some(_) => return err(ErrorKind::ExpectedCommaOrBrace),
                 },
                 State::End => {
@@ -374,6 +419,61 @@ impl Machine {
         event
     }
 
+    /// Closes the innermost object, whose `}` is at `at`, refusing it if it
+    /// repeats a key.
+    fn close_object<'s>(&mut self, src: &'s str, at: usize) -> Result<Event<'s>, Error> {
+        if self.checks_keys() {
+            let Some(open) = self.objects.pop() else {
+                return Ok(self.close(at, Event::EndObject));
+            };
+            let Self {
+                keys, arena, order, ..
+            } = self;
+            let members = keys.get(open.keys..).unwrap_or(&[]);
+            let text = |i: usize| {
+                members.get(i).map_or("", |k| {
+                    let from = if k.in_text { src } else { arena.as_str() };
+                    from.get(k.start..k.start + k.len).unwrap_or("")
+                })
+            };
+            if dupes::has_duplicates(members.len(), &text, order) {
+                let repeat = dupes::first_repeat(&text, order);
+                let quote = members.get(repeat).map_or(at, |k| k.quote);
+                return Err(Error::new(ErrorKind::DuplicateKey, quote));
+            }
+            keys.truncate(open.keys);
+            arena.truncate(open.arena);
+        }
+        Ok(self.close(at, Event::EndObject))
+    }
+
+    /// Keeps the key at `quote..end` of the object being read.
+    fn keep_key(&mut self, src: &str, quote: usize, end: usize, escaped: bool) {
+        let body = src.get(quote + 1..end - 1).unwrap_or("");
+        let entry = if escaped || self.copy_keys {
+            let start = self.arena.len();
+            if escaped {
+                self.arena.push_str(&lexer::decode(body));
+            } else {
+                self.arena.push_str(body);
+            }
+            KeyEntry {
+                quote,
+                start,
+                len: self.arena.len() - start,
+                in_text: false,
+            }
+        } else {
+            KeyEntry {
+                quote,
+                start: quote + 1,
+                len: body.len(),
+                in_text: true,
+            }
+        };
+        self.keys.push(entry);
+    }
+
     /// Counts one more value, refusing it if the budget is spent.
     #[inline]
     fn count_value(&mut self, at: usize) -> Result<(), Error> {
@@ -397,6 +497,12 @@ impl Machine {
                 Ok(if b == b'{' {
                     self.stack.push(Container::Object);
                     self.state = State::ObjectFirst;
+                    if self.checks_keys() {
+                        self.objects.push(OpenObject {
+                            keys: self.keys.len(),
+                            arena: self.arena.len(),
+                        });
+                    }
                     Event::StartObject
                 } else {
                     self.stack.push(Container::Array);
@@ -475,6 +581,9 @@ impl Machine {
                 self.pos = at + 1;
                 self.last = quote;
                 self.state = State::Value;
+                if self.checks_keys() {
+                    self.keep_key(src, quote, end, escaped);
+                }
                 Ok(Event::Key(self.body(src, quote, end, escaped)))
             }
             Some(_) => Err(Error::new(ErrorKind::ExpectedColon, at)),

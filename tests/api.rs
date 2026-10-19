@@ -286,3 +286,48 @@ fn object_editing_keeps_order() {
     assert_eq!(v.to_string(), r#"{"a":"new","b":3,"d":[]}"#);
     assert_eq!(v.pointer("/d"), Some(&json!([])));
 }
+
+#[test]
+fn test_reader_loop_with_duplicate_method_is_refused_like_parse() {
+    // The audit's JX-SEC-02 case: a second `method` must not slip through the
+    // documented envelope loop when `parse` refuses the same text.
+    let text = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","method":"shutdown","params":{}}"#;
+    let parsed = jsonx_lib::parse(text).err().map(|e| (e.kind(), e.offset()));
+    assert_eq!(parsed, Some((ErrorKind::DuplicateKey, 46)));
+
+    let run = || -> Result<Option<Value<'_>>, jsonx_lib::Error> {
+        let mut reader = Reader::new(text);
+        let mut method = None;
+        assert_eq!(reader.next_event()?, Some(Event::StartObject));
+        while let Some(Event::Key(key)) = reader.next_event()? {
+            match &*key {
+                "method" => method = reader.read_value()?,
+                _ => {
+                    let _skipped = reader.read_raw()?;
+                }
+            }
+        }
+        reader.finish()?;
+        Ok(method)
+    };
+    assert_eq!(run().err().map(|e| (e.kind(), e.offset())), parsed);
+
+    // Inside a raw slice too, and through the incremental reader.
+    let wrapped = format!("[{text}]");
+    let mut r = Reader::new(&wrapped);
+    let _start = r.next_event();
+    assert_eq!(
+        r.read_raw().err().map(|e| (e.kind(), e.offset())),
+        Some((ErrorKind::DuplicateKey, 47))
+    );
+    let mut s = jsonx_lib::StreamReader::new();
+    assert!(s.feed(text.as_bytes()).is_ok());
+    assert_eq!(s.read_raw().err().map(|e| (e.kind(), e.offset())), parsed);
+
+    // The other policies are explicit opt-ins, and pass every member through
+    // the event stream.
+    let mut r = Parser::new()
+        .duplicate_keys(DuplicateKeys::Last)
+        .reader(text);
+    assert!(r.read_raw().is_ok_and(|raw| raw == Some(text)));
+}

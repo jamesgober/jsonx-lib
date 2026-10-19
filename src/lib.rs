@@ -75,6 +75,7 @@
 extern crate alloc;
 
 mod array;
+mod dupes;
 mod encode;
 mod error;
 mod format;

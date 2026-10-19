@@ -69,9 +69,21 @@ pub enum Event<'a> {
 /// The reader works over a complete document held in memory, and borrows
 /// strings and numbers from it exactly as [`parse`](crate::parse) does.
 /// Reading is iterative: depth costs one byte of reader state per level, never
-/// stack. The reader does not look for duplicate keys, which needs memory
-/// proportional to an object's size; [`read_value`](Self::read_value) applies
-/// the configured [`DuplicateKeys`] policy to the values it builds.
+/// stack.
+///
+/// **Duplicate keys.** Under [`DuplicateKeys::Error`], the default, the
+/// reader refuses an object that repeats a key, whichever way it is read:
+/// event by event, through [`read_raw`](Self::read_raw), or through
+/// [`read_value`](Self::read_value). The check happens when the object
+/// closes, so the `}` of an object with a repeated key is never returned as
+/// [`Event::EndObject`]: the reader returns [`ErrorKind::DuplicateKey`] at
+/// the repeat's opening quote instead. A loop that collects members and acts
+/// only after the object ended (as below) can therefore never act on a
+/// smuggled second value. To check, the reader keeps each open object's keys
+/// (a slice of the input, or a decoded copy for a key with escapes) until
+/// the object closes. Under the other policies the reader passes every
+/// member through as written; [`read_value`](Self::read_value) applies
+/// `First` and `Last` to the values it builds.
 ///
 /// After an error the reader is finished: every later call returns the same
 /// error.
@@ -166,7 +178,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads the next value whole and returns its exact source text, without
-    /// decoding or allocating anything.
+    /// decoding or copying it.
     ///
     /// Call it where a value comes next: at the start, after a [`Key`](Event::Key),
     /// or between array items. The value is fully validated. If no value comes
@@ -176,11 +188,15 @@ impl<'a> Reader<'a> {
     /// it where a key comes next also returns `Ok(None)`.
     ///
     /// The text is a slice of the input: it can be stored, compared, or parsed
-    /// later, as `serde_json`'s `RawValue` is used.
+    /// later, as `serde_json`'s `RawValue` is used. Nothing of the value is
+    /// allocated; the reader's own state grows with the value's nesting (a
+    /// byte per level) and, under [`DuplicateKeys::Error`], with the keys of
+    /// its open objects.
     ///
     /// # Errors
     ///
-    /// As [`next_event`](Self::next_event), for any error inside the value.
+    /// As [`next_event`](Self::next_event), for any error inside the value,
+    /// including a repeated key under [`DuplicateKeys::Error`].
     ///
     /// # Examples
     ///

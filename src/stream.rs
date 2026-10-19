@@ -210,7 +210,12 @@ impl StreamReader {
             utf8_error: None,
             fed: 0,
             ended: false,
-            machine: Machine::new(limits, duplicates, false),
+            machine: {
+                let mut machine = Machine::new(limits, duplicates, false);
+                // Keys outlive the front of the buffer, which is dropped.
+                machine.copy_keys = true;
+                machine
+            },
             failed: None,
             last: 0,
             raw: None,
@@ -453,10 +458,8 @@ impl StreamReader {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        let span = match self.raw_span() {
-            Ok(Step::Ready(span)) => span,
-            Ok(Step::NeedInput) => return Ok(Step::NeedInput),
-            Err(e) => return Err(self.duplicate_before(e)),
+        let Step::Ready(span) = self.raw_span()? else {
+            return Ok(Step::NeedInput);
         };
         let Some((start, end)) = span else {
             return Ok(Step::Ready(None));
@@ -465,8 +468,9 @@ impl StreamReader {
             .buf
             .get(start - self.base..end - self.base)
             .unwrap_or("");
-        // The budgets were checked while the value was skipped; only the
-        // duplicate-key policy remains.
+        // The budgets, and duplicates under `DuplicateKeys::Error`, were
+        // checked while the value was skipped; only `First` and `Last`
+        // remain to apply.
         let parser = Parser::new()
             .limits(Limits::unlimited())
             .duplicate_keys(self.machine.duplicates);
@@ -648,34 +652,6 @@ impl StreamReader {
                 self.raw = Some(progress);
                 self.halt(e)
             }
-        }
-    }
-
-    /// The error `read_value` reports when skipping the value stopped at
-    /// `e`: a duplicate key in an object that closed before `e`, if there is
-    /// one, as [`Reader::read_value`](crate::Reader::read_value), which
-    /// checks each object as it closes, would report; otherwise `e`.
-    fn duplicate_before(&mut self, e: Error) -> Error {
-        let Some(RawProgress {
-            start: Some(start), ..
-        }) = self.raw
-        else {
-            return e;
-        };
-        if self.machine.duplicates != DuplicateKeys::Error {
-            return e;
-        }
-        let text = self.buf.get(start - self.base..).unwrap_or("");
-        let parser = Parser::new().limits(Limits::unlimited());
-        match parser.reader(text).read_value() {
-            Err(dup)
-                if dup.kind() == ErrorKind::DuplicateKey && start + dup.offset() < e.offset() =>
-            {
-                let dup = Error::new(ErrorKind::DuplicateKey, start + dup.offset());
-                self.failed = Some(dup);
-                dup
-            }
-            _ => e,
         }
     }
 

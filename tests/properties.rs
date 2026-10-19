@@ -247,6 +247,63 @@ proptest! {
     }
 }
 
+/// Objects whose keys come from a small set, so they often repeat.
+fn repeating_objects() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec!["a", "b", "\\u0061", "c\\n", "c\\u000a"]);
+    let leaf = prop_oneof![
+        Just("1".to_owned()),
+        Just("[]".to_owned()),
+        Just("\"x\"".to_owned())
+    ];
+    leaf.prop_recursive(4, 40, 6, move |inner| {
+        prop_oneof![
+            prop::collection::vec((key.clone(), inner.clone()), 0..6).prop_map(|members| {
+                let body: Vec<String> = members
+                    .iter()
+                    .map(|(k, v)| format!("\"{k}\":{v}"))
+                    .collect();
+                format!("{{{}}}", body.join(","))
+            }),
+            prop::collection::vec(inner, 0..4).prop_map(|items| format!("[{}]", items.join(","))),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    /// JX-SEC-02: under the default policy, every way of reading refuses the
+    /// same duplicate at the same offset: `parse`, the event loop,
+    /// `read_raw`, and the incremental reader.
+    #[test]
+    fn prop_every_reading_path_refuses_the_same_duplicates(text in repeating_objects(), cut in any::<Index>()) {
+        let parsed = jsonx_lib::parse(&text).err();
+        let mut events = jsonx_lib::Reader::new(&text);
+        let streamed = loop {
+            match events.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break None,
+                Err(e) => break Some(e),
+            }
+        };
+        prop_assert_eq!(streamed, parsed);
+        prop_assert_eq!(jsonx_lib::Reader::new(&text).read_raw().err(), parsed);
+        let mut incremental = jsonx_lib::StreamReader::new();
+        let at = cut.index(text.len() + 1);
+        let (head, tail) = text.as_bytes().split_at(at);
+        prop_assert!(incremental.feed(head).is_ok());
+        let raw = match incremental.read_raw() {
+            Err(e) => Err(e),
+            Ok(jsonx_lib::Step::Ready(_)) => Ok(()),
+            Ok(jsonx_lib::Step::NeedInput) => incremental.feed(tail).and_then(|()| {
+                incremental.end_input();
+                incremental.read_raw().map(|_| ())
+            }),
+        };
+        prop_assert_eq!(raw.err(), parsed);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4096))]
 
