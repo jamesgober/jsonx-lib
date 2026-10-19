@@ -410,6 +410,21 @@ impl<'a> Reader<'a> {
 
     // ---- internals -----------------------------------------------------------
 
+    /// Whether a value comes next (consuming a separating `,`).
+    #[inline]
+    pub(crate) fn at_a_value(&mut self) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        self.machine.at_value(self.src)
+    }
+
+    /// The reader's duplicate-key policy.
+    #[inline]
+    pub(crate) fn duplicate_policy(&self) -> DuplicateKeys {
+        self.machine.duplicates
+    }
+
     /// Consumes one whole value (the reader is positioned at it) and returns
     /// its text.
     fn skip_value(&mut self) -> Result<&'a str, Error> {

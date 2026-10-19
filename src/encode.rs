@@ -19,7 +19,7 @@ use alloc::{
 };
 use core::convert::Infallible;
 
-use crate::{Array, Format, Number, Object, Value, number, write};
+use crate::{Array, Format, Number, Object, RawValue, Value, number, write};
 
 /// Takes the output buffer when it holds enough to pass on.
 pub(crate) trait Flush {
@@ -280,6 +280,37 @@ impl<'w> ValueWriter<'w> {
     #[inline]
     pub fn str(mut self, value: &str) -> Written {
         write::write_str(self.out.buf, value, self.out.format);
+        self.out.done()
+    }
+
+    /// Writes a [`RawValue`]'s text unchanged: already valid JSON, so it is
+    /// neither checked again nor re-escaped. In the pretty layout the text
+    /// keeps its own spacing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{RawValue, ToJson, ValueWriter, Written};
+    ///
+    /// struct Forward<'a> { id: u64, result: RawValue<'a> }
+    ///
+    /// impl ToJson for Forward<'_> {
+    ///     fn to_json(&self, out: ValueWriter<'_>) -> Written {
+    ///         out.object(|o| {
+    ///             o.member("id", &self.id);
+    ///             o.member_with("result", |w| w.raw(&self.result));
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let result = RawValue::new(r#"{"items": [1, 2]}"#)?;
+    /// let reply = Forward { id: 3, result };
+    /// assert_eq!(jsonx_lib::to_string(&reply), r#"{"id":3,"result":{"items": [1, 2]}}"#);
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[inline]
+    pub fn raw(mut self, value: &RawValue<'_>) -> Written {
+        self.out.buf.push_str(value.as_str());
         self.out.done()
     }
 
@@ -622,7 +653,8 @@ impl ArrayWriter<'_> {
 
 /// A type that writes itself as JSON, straight into the output.
 ///
-/// This is the explicit, hand-written half of jsonx-lib's typed API. There is no derive and no
+/// This is the explicit, hand-written half of jsonx-lib's typed API (the
+/// other half is [`FromJson`](crate::FromJson)). There is no derive and no
 /// reflection: an implementation says, in code, which members a type has and
 /// what their keys are, and the compiler checks that it writes exactly one
 /// well-formed value. Nothing is built in between: no [`Value`], no
@@ -729,7 +761,8 @@ impl ArrayWriter<'_> {
 /// eight (arrays); `BTreeMap<K, V>` and with `std` `HashMap<K, V, S>`
 /// (objects, keys through [`ToJsonKey`]; a `HashMap` writes in its own
 /// order, so use a `BTreeMap` for deterministic output); and this crate's
-/// [`Value`], [`Number`], [`Array`], and [`Object`].
+/// [`Value`], [`Number`], [`Array`], [`Object`], [`RawValue`], and
+/// [`Nullable`](crate::Nullable).
 pub trait ToJson {
     /// Writes `self` as one JSON value.
     fn to_json(&self, out: ValueWriter<'_>) -> Written;

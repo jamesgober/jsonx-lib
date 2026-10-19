@@ -75,6 +75,7 @@
 extern crate alloc;
 
 mod array;
+mod decode;
 mod dupes;
 mod encode;
 mod error;
@@ -86,6 +87,7 @@ mod macros;
 mod number;
 mod object;
 mod parser;
+mod raw;
 mod reader;
 mod scan;
 mod stream;
@@ -95,6 +97,10 @@ mod write;
 mod writer;
 
 pub use array::Array;
+pub use decode::{
+    ArrayReader, DecodeError, DecodeErrorKind, FromJson, FromJsonKey, Nullable, ObjectReader,
+    PathSegment, from_bytes, from_str, from_value, to_value,
+};
 pub use encode::{ArrayWriter, ObjectWriter, ToJson, ToJsonKey, ValueWriter, Written};
 pub use error::{Error, ErrorKind};
 pub use format::Format;
@@ -102,6 +108,7 @@ pub use limits::Limits;
 pub use number::Number;
 pub use object::{Iter, IterMut, Object};
 pub use parser::{DuplicateKeys, Parser};
+pub use raw::RawValue;
 pub use reader::{Event, Reader};
 pub use stream::{Step, StreamReader};
 pub use value::{Kind, Value};

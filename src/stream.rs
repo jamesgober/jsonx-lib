@@ -3,7 +3,7 @@
 use alloc::string::String;
 
 use crate::{
-    DuplicateKeys, Kind, Limits, Parser, Value,
+    DecodeError, DuplicateKeys, FromJson, Kind, Limits, Parser, Value,
     error::{Error, ErrorKind},
     machine::Machine,
     reader::Event,
@@ -512,6 +512,57 @@ impl StreamReader {
                 Err(e)
             }
         }
+    }
+
+    /// Reads the next value whole as a `T` ([`FromJson`]); positioning as
+    /// for [`read_raw`](Self::read_raw). The value borrows from the buffer,
+    /// as `T` allows.
+    ///
+    /// The value is first skipped (validated, with every budget) as it
+    /// arrives, then read as `T` once it is all there. Byte offsets in an
+    /// error count from the first byte fed.
+    ///
+    /// # Errors
+    ///
+    /// The [`DecodeError`] of `T`, or the reader's error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Step, StreamReader};
+    ///
+    /// let mut r = StreamReader::new().documents();
+    /// r.feed(b"[1, 2]\n[3")?;
+    /// assert_eq!(r.decode::<Vec<u8>>()?, Step::Ready(Some(vec![1, 2])));
+    /// assert_eq!(r.decode::<Vec<u8>>()?, Step::NeedInput);
+    /// r.feed(b"]\n")?;
+    /// r.end_input();
+    /// assert_eq!(r.decode::<Vec<u8>>()?, Step::Ready(Some(vec![3])));
+    /// assert_eq!(r.decode::<Vec<u8>>()?, Step::Ready(None));
+    /// # Ok::<(), jsonx_lib::DecodeError>(())
+    /// ```
+    pub fn decode<'s, T: FromJson<'s>>(&'s mut self) -> Result<Step<Option<T>>, DecodeError> {
+        let Step::Ready(span) = self.raw_span()? else {
+            return Ok(Step::NeedInput);
+        };
+        let Some((start, end)) = span else {
+            return Ok(Step::Ready(None));
+        };
+        let text = self
+            .buf
+            .get(start - self.base..end - self.base)
+            .unwrap_or("");
+        // The budgets, and duplicates under `DuplicateKeys::Error`, were
+        // checked while the value was skipped. The depth budget stays, to
+        // bound a recursive `T`.
+        let limits = Limits::unlimited().with_max_depth(self.machine.limits.max_depth);
+        let parser = Parser::new()
+            .limits(limits)
+            .duplicate_keys(self.machine.duplicates);
+        parser
+            .decode(text)
+            .map(|value| Step::Ready(Some(value)))
+            .map_err(|e| e.shifted(start))
     }
 
     /// The kind of the next value, without consuming anything: `Ready(None)`
