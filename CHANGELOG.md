@@ -77,7 +77,8 @@ budget, `json!` for large literals, fuzzing.
   apart. `RawValue<'a>`: one validated value kept as text (`new`,
   `from_string`, `encode`, `as_str`, `into_owned`, `parse`, `decode`), taken
   from a reader with no second scan (`Reader::read_raw_value`) and written
-  verbatim.
+  without a second check (with the strict formats' escaping applied inside
+  its strings).
 - `StreamReader`, the incremental reader: `feed` bytes as they arrive (any
   split, inside tokens and UTF-8 characters), events out as they complete,
   with the same grammar, budgets, errors, and offsets as `Reader`; tokens cut

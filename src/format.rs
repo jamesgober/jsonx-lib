@@ -15,8 +15,12 @@
 /// - [`ascii`](Self::ascii) escapes every non-ASCII character as `\uXXXX`
 ///   (a surrogate pair above U+FFFF), for channels that are not 8-bit clean.
 ///
-/// Every format writes valid JSON that reads back as the same value; they
-/// differ only in bytes.
+/// Both apply to everything written, [`RawValue`](crate::RawValue) text
+/// included (its strings are escaped the same way). Every format writes
+/// valid JSON that reads back as the same value (for objects without
+/// repeated keys: the writers do not check for them; see
+/// [`ObjectWriter`](crate::ObjectWriter)); the formats differ only in
+/// bytes.
 ///
 /// The struct is `#[non_exhaustive]`: build it from [`Format::compact`] or
 /// [`Format::pretty`] and the `with_*` methods.

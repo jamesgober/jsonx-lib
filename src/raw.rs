@@ -21,8 +21,19 @@ use crate::{
 /// [`from_string`](Self::from_string) check the text,
 /// [`Reader::read_raw_value`] and `FromJson` take it from a read that
 /// checked it, and [`encode`](Self::encode) takes it from this crate's
-/// writer. So writing one ([`ToJson`]) copies the text unchanged with no
-/// second check, and the output stays valid JSON.
+/// writer. So writing one ([`ToJson`]) copies the text with no second
+/// check, and the output stays valid JSON. Under
+/// [`Format::html_safe`](crate::Format::html_safe) or
+/// [`Format::ascii`](crate::Format::ascii) the characters those formats
+/// escape are escaped inside the text's strings as well (see
+/// [`ValueWriter::raw`](crate::ValueWriter::raw)); otherwise the text is
+/// copied unchanged.
+///
+/// Valid means grammatical JSON. A `RawValue` taken under
+/// [`DuplicateKeys::KeepAll`](crate::DuplicateKeys::KeepAll), or made by
+/// [`encode`](Self::encode) from a `ToJson` that writes a key twice, can
+/// hold an object with a repeated key: [`decode`](Self::decode) (default
+/// policy) refuses that text, [`parse`](Self::parse) keeps every member.
 ///
 /// # Examples
 ///

@@ -222,6 +222,39 @@ proptest! {
         prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::pretty()), jsonx_lib::to_string_pretty(&v));
     }
 
+    /// Raw text obeys the strict formats too: forwarded verbatim in the
+    /// plain ones, with `<`, `>`, `&`, and non-ASCII escaped in its strings
+    /// under HTML-safe and ASCII-only, and the same value either way.
+    #[test]
+    fn prop_raw_values_obey_every_format(v in value(), s in tricky_string(), pretty in any::<bool>(), ascii in any::<bool>(), html in any::<bool>()) {
+        let base = if pretty { Format::pretty() } else { Format::compact() };
+        let format = base.ascii(ascii).html_safe(html);
+        let doc = jsonx_lib::json!({ "s": s.as_str(), "v": v.clone(), "tag": "</script>&<b>caf\u{e9}\u{2028}" });
+        let raw = jsonx_lib::RawValue::encode(&doc);
+        let text = jsonx_lib::to_string_with(&raw, format);
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&text).ok(), Some(doc.clone()));
+        if ascii {
+            prop_assert!(text.is_ascii());
+        }
+        if html {
+            prop_assert!(!text.contains(['<', '>', '&']));
+        }
+        if !ascii && !html {
+            prop_assert_eq!(text.as_str(), raw.as_str());
+        }
+        // The push writer writes raw values the same way.
+        let mut out = String::new();
+        let mut w = Writer::new(&mut out).with_format(format);
+        w.begin_array().unwrap();
+        w.value(&raw).unwrap();
+        w.end_array().unwrap();
+        w.finish().unwrap();
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&out).ok(), Some(Value::Array(vec![doc].into())));
+        if html {
+            prop_assert!(!out.contains(['<', '>', '&']));
+        }
+    }
+
     /// The push writer, fed a reader's events, writes what the value writers
     /// write, in every layout.
     #[test]

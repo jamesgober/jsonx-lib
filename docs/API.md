@@ -906,7 +906,7 @@ V>`, (`std`) `HashMap<K, V, S>` (keys through [`ToJsonKey`](#tojsonkey); a
 | `f64`, `f32` | Shortest round-trip text (`1.0`, `0.1`); NaN and the infinities as `null`. |
 | `number(&Number)` | The number's exact text. |
 | `str(&str)` | The string, escaped. |
-| `raw(&RawValue)` | The raw text, unchanged. |
+| `raw(&RawValue)` | The raw text: unchanged in the plain formats; under `html_safe` / `ascii`, with those characters escaped inside its strings. |
 | `value(&Value)` | A value, iteratively, in the writer's layout. |
 | `json(&T)` | `T`'s own `ToJson`. |
 | `object(impl FnOnce(&mut ObjectWriter<'_>))`, `array(impl FnOnce(&mut ArrayWriter<'_>))` | A container built in the closure. |
@@ -980,7 +980,13 @@ One complete JSON value kept as its exact text, with no whitespace around it:
 validated once, then stored, forwarded, or read later (`serde_json`'s
 `RawValue`). Every way of making one validates or takes text this crate has
 just validated or written, so writing one copies the text with no second
-check and the output stays valid JSON.
+check and the output stays valid JSON. The strict [`Format`](#format)s
+apply to it too: under `html_safe` or `ascii` the characters they escape
+are escaped inside the raw text's strings, so `</script>` in a forwarded
+result cannot reach a page that asked for HTML-safe output. Valid means
+grammatical: a `RawValue` read under `KeepAll`, or encoded from a `ToJson`
+that writes a key twice, can hold a repeated key, which `decode` (default
+policy) refuses and `parse` keeps.
 
 | Item | Description |
 |---|---|

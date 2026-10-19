@@ -283,9 +283,15 @@ impl<'w> ValueWriter<'w> {
         self.out.done()
     }
 
-    /// Writes a [`RawValue`]'s text unchanged: already valid JSON, so it is
-    /// neither checked again nor re-escaped. In the pretty layout the text
-    /// keeps its own spacing.
+    /// Writes a [`RawValue`]'s text: already valid JSON, so it is not
+    /// checked again. In the plain formats it is copied unchanged (in the
+    /// pretty layout it keeps its own spacing). Under
+    /// [`Format::html_safe`](crate::Format::html_safe) or
+    /// [`Format::ascii`](crate::Format::ascii), the characters that format
+    /// escapes are escaped inside the raw text's strings too (the only place
+    /// valid JSON can hold them), so `</script>` in a forwarded value is
+    /// written `\u003c/script\u003e` and the format's promise holds; the
+    /// value it stands for is unchanged.
     ///
     /// # Examples
     ///
@@ -310,7 +316,7 @@ impl<'w> ValueWriter<'w> {
     /// ```
     #[inline]
     pub fn raw(mut self, value: &RawValue<'_>) -> Written {
-        self.out.buf.push_str(value.as_str());
+        crate::write::write_raw(self.out.buf, value.as_str(), self.out.format);
         self.out.done()
     }
 

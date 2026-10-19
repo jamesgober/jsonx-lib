@@ -140,6 +140,39 @@ fn write_string_strict(out: &mut String, text: &str, format: Format) {
     out.push('"');
 }
 
+/// Appends `raw`, the text of one valid JSON value, in `format`: unchanged
+/// in the plain formats; under a strict one, with every character that
+/// format escapes in strings (`<`, `>`, `&` when HTML-safe, anything
+/// non-ASCII when ASCII-only, U+2028 and U+2029 in both) written as its
+/// `\uXXXX` escape. In valid JSON those characters can only occur inside
+/// strings, where the escape stands for the same character, so the value is
+/// unchanged and the format's byte guarantees hold for raw text too.
+pub(crate) fn write_raw(out: &mut String, raw: &str, format: Format) {
+    if !format.strict() {
+        out.push_str(raw);
+        return;
+    }
+    out.reserve(raw.len());
+    let mut from = 0;
+    for (at, ch) in raw.char_indices() {
+        let escape = match ch {
+            '\u{2028}' | '\u{2029}' => true,
+            '<' | '>' | '&' => format.html,
+            _ => format.ascii && !ch.is_ascii(),
+        };
+        if !escape {
+            continue;
+        }
+        out.push_str(raw.get(from..at).unwrap_or(""));
+        from = at + ch.len_utf8();
+        let mut units = [0u16; 2];
+        for unit in ch.encode_utf16(&mut units) {
+            push_unicode_escape(out, *unit);
+        }
+    }
+    out.push_str(raw.get(from..).unwrap_or(""));
+}
+
 /// Appends the six-character escape for one UTF-16 code unit, lowercase.
 fn push_unicode_escape(out: &mut String, unit: u16) {
     out.push('\\');
