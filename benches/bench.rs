@@ -10,7 +10,9 @@
 use std::{fmt::Write as _, hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use jsonx_lib::{DuplicateKeys, Event, Limits, Number, Parser, Step, Value};
+use std::borrow::Cow;
+
+use jsonx_lib::{DuplicateKeys, Event, Limits, Number, Parser, Step, Value, json_struct};
 
 /// No budgets: the 100 MB document is over the default 64 MiB input budget.
 const UNLIMITED: Parser = Parser::new().limits(Limits::unlimited());
@@ -187,6 +189,56 @@ fn bench_numbers(c: &mut Criterion) {
     group.finish();
 }
 
+/// One item of the document, as typed data: strings borrowed where the
+/// text has no escapes.
+struct Item<'a> {
+    id: u64,
+    label: &'a str,
+    detail: Cow<'a, str>,
+    kind: u8,
+    score: f64,
+    deprecated: bool,
+    range: Range,
+    tags: Vec<Option<Cow<'a, str>>>,
+    data: Vec<i64>,
+}
+json_struct!(Item<'a> { id, label, detail, kind, score, deprecated, range, tags, data });
+
+struct Range {
+    start: Pos,
+    end: Pos,
+}
+json_struct!(Range { start, end });
+
+struct Pos {
+    line: u32,
+    character: u32,
+}
+json_struct!(Pos { line, character });
+
+/// Typed reading (`FromJson`) and writing (`ToJson`) of the 1 MB document,
+/// against the same through a `Value`.
+fn bench_typed(c: &mut Criterion) {
+    let text = document(1 << 20);
+    let items: Vec<Item<'_>> = UNLIMITED.decode(&text).unwrap_or_default();
+    let mut group = c.benchmark_group("typed_1mb");
+    group
+        .sample_size(50)
+        .measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Bytes(text.len() as u64));
+    group.bench_function("decode_structs", |b| {
+        b.iter(|| {
+            UNLIMITED
+                .decode::<Vec<Item<'_>>>(black_box(&text))
+                .map(|v| v.len())
+        })
+    });
+    group.bench_function("encode_structs", |b| {
+        b.iter(|| jsonx_lib::to_string(black_box(&items)))
+    });
+    group.finish();
+}
+
 /// The incremental reader over the 1 MB document, fed in network-sized
 /// chunks, against the complete reader over the same text.
 fn bench_stream(c: &mut Criterion) {
@@ -221,6 +273,7 @@ criterion_group!(
     benches,
     bench_1mb,
     bench_pretty,
+    bench_typed,
     bench_stream,
     bench_strings,
     bench_numbers,
