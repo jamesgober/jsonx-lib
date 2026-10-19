@@ -1,4 +1,4 @@
-//! The `json!` macro.
+//! The `json!` and `json_struct!` macros.
 
 /// Builds a [`Value`](crate::Value) from JSON-like syntax.
 ///
@@ -247,6 +247,123 @@ macro_rules! __json_member {
     // Any other token joins the value.
     ([$($done:expr,)*] ($key:expr) [$($value:tt)*] $next:tt $($rest:tt)*) => {
         $crate::__json_member!([$($done,)*] ($key) [$($value)* $next] $($rest)*)
+    };
+}
+
+/// Implements [`ToJson`](crate::ToJson) and [`FromJson`](crate::FromJson)
+/// for a struct whose fields map one to one onto object members.
+///
+/// The macro writes exactly the hand implementation the
+/// [`FromJson`](crate::FromJson) docs show, nothing more: each field listed
+/// is a member, keyed by the field's name or by the string given after a
+/// colon (`new_text: "newText"`). It is a `macro_rules!` macro over the list
+/// you write, not a derive: no attribute, no reflection, and every key is in
+/// your source.
+///
+/// - **Reading:** members in any order; unknown members skipped (and
+///   validated); a repeated field refused
+///   ([`DecodeErrorKind::DuplicateField`](crate::DecodeErrorKind::DuplicateField));
+///   a missing field refused
+///   ([`DecodeErrorKind::MissingField`](crate::DecodeErrorKind::MissingField))
+///   unless its type allows absence: an `Option<T>` field reads as `None`,
+///   a [`Nullable<T>`](crate::Nullable) as `Absent`.
+/// - **Writing:** members in the order listed; an `Option<T>` field that is
+///   `None` (or a `Nullable` that is `Absent`) is left out, which is
+///   TypeScript's `key?: T` as LSP and MCP use it.
+///
+/// For a struct with a lifetime (to borrow strings from the input), name it:
+/// `json_struct!(Name<'a> { ... })`. For anything else (renamed variants,
+/// defaults, validation, enums), write the impls by hand.
+///
+/// # Examples
+///
+/// ```
+/// use std::borrow::Cow;
+/// use jsonx_lib::json_struct;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct Position { line: u32, character: u32 }
+/// json_struct!(Position { line, character });
+///
+/// #[derive(Debug, PartialEq)]
+/// struct TextEdit<'a> { range: [Position; 2], new_text: Cow<'a, str>, label: Option<String> }
+/// json_struct!(TextEdit<'a> { range, new_text: "newText", label });
+///
+/// let text = r#"{"newText": "x", "range": [{"line": 1, "character": 0}, {"line": 1, "character": 3}]}"#;
+/// let edit: TextEdit = jsonx_lib::from_str(text)?;
+/// assert_eq!(edit.new_text, "x");
+/// assert_eq!(edit.label, None);
+/// assert_eq!(
+///     jsonx_lib::to_string(&edit),
+///     r#"{"range":[{"line":1,"character":0},{"line":1,"character":3}],"newText":"x"}"#
+/// );
+/// # Ok::<(), jsonx_lib::DecodeError>(())
+/// ```
+#[macro_export]
+macro_rules! json_struct {
+    ($name:ident { $($field:ident $(: $key:literal)?),* $(,)? }) => {
+        impl $crate::ToJson for $name {
+            $crate::__json_struct_to_json!($($field $(: $key)?),*);
+        }
+        impl<'de> $crate::FromJson<'de> for $name {
+            $crate::__json_struct_from_json!('de; $($field $(: $key)?),*);
+        }
+    };
+    ($name:ident < $lt:lifetime > { $($field:ident $(: $key:literal)?),* $(,)? }) => {
+        impl<$lt> $crate::ToJson for $name<$lt> {
+            $crate::__json_struct_to_json!($($field $(: $key)?),*);
+        }
+        impl<$lt> $crate::FromJson<$lt> for $name<$lt> {
+            $crate::__json_struct_from_json!($lt; $($field $(: $key)?),*);
+        }
+    };
+}
+
+/// Implementation detail of [`json_struct!`]: a field's key.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __json_struct_key {
+    ($field:ident) => {
+        ::core::stringify!($field)
+    };
+    ($field:ident : $key:literal) => {
+        $key
+    };
+}
+
+/// Implementation detail of [`json_struct!`]: `ToJson::to_json`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __json_struct_to_json {
+    ($($field:ident $(: $key:literal)?),*) => {
+        fn to_json(&self, out: $crate::ValueWriter<'_>) -> $crate::Written {
+            out.object(|object| {
+                $(object.optional($crate::__json_struct_key!($field $(: $key)?), &self.$field);)*
+            })
+        }
+    };
+}
+
+/// Implementation detail of [`json_struct!`]: `FromJson::from_json`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __json_struct_from_json {
+    ($lt:lifetime; $($field:ident $(: $key:literal)?),*) => {
+        fn from_json(
+            reader: &mut $crate::Reader<$lt>,
+        ) -> ::core::result::Result<Self, $crate::DecodeError> {
+            $(let mut $field = ::core::option::Option::None;)*
+            let mut object = reader.read_object()?;
+            while let ::core::option::Option::Some(key) = object.next_key()? {
+                match &*key {
+                    $($crate::__json_struct_key!($field $(: $key)?) => object.field(&mut $field)?,)*
+                    _ => {}
+                }
+            }
+            ::core::result::Result::Ok(Self {
+                $($field: object.required($field, $crate::__json_struct_key!($field $(: $key)?))?,)*
+            })
+        }
     };
 }
 

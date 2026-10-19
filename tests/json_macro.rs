@@ -1,7 +1,83 @@
-//! `json!` literals far past the size where a token-by-token macro hits the
+//! `json_struct!`, and `json!` literals far past the size where a token-by-token macro hits the
 //! default recursion limit (audit JX-COR-02).
 
-use jsonx_lib::json;
+use std::borrow::Cow;
+
+use jsonx_lib::{DecodeErrorKind, ErrorKind, Nullable, json, json_struct};
+
+#[derive(Debug, PartialEq)]
+struct Position {
+    line: u32,
+    character: u32,
+}
+json_struct!(Position { line, character });
+
+#[derive(Debug, PartialEq)]
+struct Item<'a> {
+    label: Cow<'a, str>,
+    detail: Option<String>,
+    kind: Nullable<u8>,
+    // Field names that the expansion also uses for its own variables.
+    object: Vec<Position>,
+    key: bool,
+    reader: (),
+}
+json_struct!(Item<'a> { label, detail, kind: "itemKind", object: "positions", key, reader, });
+
+#[derive(Debug, PartialEq, Default)]
+struct Empty {}
+json_struct!(Empty {});
+
+#[test]
+fn test_json_struct_round_trips_and_follows_the_rules() {
+    let text = r#"{"label":"x","itemKind":null,"positions":[{"line":1,"character":2}],"key":true,"reader":null}"#;
+    let item: Result<Item, _> = jsonx_lib::from_str(text);
+    let item = item.unwrap_or_else(|e| panic!("{e}"));
+    assert!(matches!(item.label, Cow::Borrowed("x")));
+    assert_eq!(item.detail, None);
+    assert_eq!(item.kind, Nullable::Null);
+    assert_eq!(jsonx_lib::to_string(&item), text);
+
+    // Absent `Option` and `Nullable` fields are fine; anything else is required.
+    let bare: Result<Item, _> =
+        jsonx_lib::from_str(r#"{"label":"y","positions":[],"key":false,"reader":null}"#);
+    assert!(bare.is_ok_and(|b| b.kind == Nullable::Absent));
+    let err = jsonx_lib::from_str::<Position>(r#"{"line": 1}"#).err();
+    assert_eq!(
+        err.map(|e| e.kind().clone()),
+        Some(DecodeErrorKind::MissingField("character"))
+    );
+    // Unknown members are skipped; repeats are refused.
+    let p: Result<Position, _> = jsonx_lib::from_str(r#"{"x": [1], "line": 1, "character": 2}"#);
+    assert_eq!(
+        p.ok(),
+        Some(Position {
+            line: 1,
+            character: 2
+        })
+    );
+    let err = jsonx_lib::from_str::<Position>(r#"{"line": 1, "line": 2, "character": 2}"#).err();
+    assert_eq!(
+        err.map(|e| (e.kind().clone(), e.pointer())),
+        Some((DecodeErrorKind::DuplicateField, "/line".to_owned()))
+    );
+    let err = jsonx_lib::from_str::<Position>("[1, 2]").err();
+    assert!(matches!(
+        err.map(|e| e.kind().clone()),
+        Some(DecodeErrorKind::WrongType { .. })
+    ));
+    let err = jsonx_lib::from_str::<Position>(r#"{"line": 1, "character": 2,}"#).err();
+    assert_eq!(
+        err.and_then(|e| e.syntax_error()).map(|e| e.kind()),
+        Some(ErrorKind::TrailingComma)
+    );
+
+    assert_eq!(jsonx_lib::to_string(&Empty {}), "{}");
+    assert_eq!(
+        jsonx_lib::from_str::<Empty>(r#"{"anything": 1}"#).ok(),
+        Some(Empty {})
+    );
+}
 
 #[test]
 fn test_json_macro_with_two_thousand_items_compiles() {
