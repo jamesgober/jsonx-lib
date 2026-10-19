@@ -75,6 +75,7 @@
 extern crate alloc;
 
 mod array;
+mod encode;
 mod error;
 mod lexer;
 mod limits;
@@ -91,6 +92,7 @@ mod value;
 mod write;
 
 pub use array::Array;
+pub use encode::{ArrayWriter, ObjectWriter, ToJson, ToJsonKey, ValueWriter, Written};
 pub use error::{Error, ErrorKind};
 pub use limits::Limits;
 pub use number::Number;

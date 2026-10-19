@@ -9,7 +9,9 @@ use common::{
     strategies::{mutated, soup, tricky_string, value},
     to_ref,
 };
-use jsonx_lib::{DuplicateKeys, ErrorKind, Event, Limits, Parser, Value};
+use jsonx_lib::{
+    DuplicateKeys, ErrorKind, Event, Limits, Parser, ToJson, Value, ValueWriter, Written,
+};
 use proptest::{prelude::*, sample::Index};
 
 /// No budgets and no duplicate check: the grammar alone decides.
@@ -167,6 +169,36 @@ proptest! {
         prop_assert_eq!(reader.read_raw().ok(), Some(None));
         prop_assert_eq!(reader.next_event().ok().flatten(), Some(Event::EndArray));
         prop_assert!(reader.finish().is_ok());
+    }
+
+    /// Typed output (`ToJson`) nests a `Value` in the same layout as a `Value`
+    /// built around it, compact and pretty, and every output path agrees.
+    #[test]
+    fn prop_typed_output_matches_value_output(v in value(), items in prop::collection::vec(value(), 0..4)) {
+        struct Holder<'a> { v: &'a Value<'a>, items: &'a [Value<'static>] }
+        impl ToJson for Holder<'_> {
+            fn to_json(&self, out: ValueWriter<'_>) -> Written {
+                out.object(|o| {
+                    o.member("v", self.v);
+                    o.member_with("items", |w| w.array(|a| a.items(self.items)));
+                    o.member("n", &[1u8, 2]);
+                })
+            }
+        }
+        let holder = Holder { v: &v, items: &items };
+        let mut built = jsonx_lib::Object::new();
+        built.push("v", v.clone());
+        built.push("items", Value::from(items.clone()));
+        built.push("n", jsonx_lib::json!([1, 2]));
+        let built = Value::Object(built);
+        prop_assert_eq!(jsonx_lib::to_string(&holder), jsonx_lib::to_string(&built));
+        prop_assert_eq!(jsonx_lib::to_string_pretty(&holder), jsonx_lib::to_string_pretty(&built));
+        #[cfg(feature = "std")]
+        {
+            let mut io = Vec::new();
+            prop_assert!(jsonx_lib::to_writer_pretty(&mut io, &holder).is_ok());
+            prop_assert_eq!(io, jsonx_lib::to_string_pretty(&built).into_bytes());
+        }
     }
 
     /// Clone, equality, and `into_owned` agree with each other.

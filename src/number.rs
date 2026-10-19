@@ -225,14 +225,13 @@ impl<'a> Number<'a> {
 }
 
 macro_rules! from_integer {
-    ($($t:ty),*) => {$(
+    ($($t:ty => $via:ty, $write:ident);* $(;)?) => {$(
         impl From<$t> for Number<'static> {
             /// Writes the integer in decimal.
             #[inline]
             fn from(value: $t) -> Self {
                 let mut text = String::new();
-                // Writing to a `String` cannot fail.
-                let _infallible = write!(text, "{value}");
+                $write(&mut text, <$via>::from(value));
                 Self { text: Cow::Owned(text) }
             }
         }
@@ -240,8 +239,42 @@ macro_rules! from_integer {
 }
 
 from_integer!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+    i8 => i64, write_i64; i16 => i64, write_i64; i32 => i64, write_i64; i64 => i64, write_i64;
+    u8 => u64, write_u64; u16 => u64, write_u64; u32 => u64, write_u64; u64 => u64, write_u64;
+    i128 => i128, write_i128; u128 => u128, write_u128;
 );
+
+impl From<isize> for Number<'static> {
+    /// Writes the integer in decimal.
+    #[inline]
+    fn from(value: isize) -> Self {
+        let mut text = String::new();
+        // `isize` is at most 64 bits on every target Rust supports; the
+        // 128-bit path covers anything wider.
+        match i64::try_from(value) {
+            Ok(n) => write_i64(&mut text, n),
+            Err(_) => write_i128(&mut text, value as i128),
+        }
+        Self {
+            text: Cow::Owned(text),
+        }
+    }
+}
+
+impl From<usize> for Number<'static> {
+    /// Writes the integer in decimal.
+    #[inline]
+    fn from(value: usize) -> Self {
+        let mut text = String::new();
+        match u64::try_from(value) {
+            Ok(n) => write_u64(&mut text, n),
+            Err(_) => write_u128(&mut text, value as u128),
+        }
+        Self {
+            text: Cow::Owned(text),
+        }
+    }
+}
 
 impl fmt::Display for Number<'_> {
     /// Writes the number's exact text.
@@ -278,32 +311,124 @@ fn zeros(out: &mut String, count: usize) {
     out.extend(core::iter::repeat_n('0', count));
 }
 
+/// Appends `value` in decimal. Digits are produced into a stack buffer, so
+/// nothing is allocated beyond `out`'s own growth.
+#[inline]
+pub(crate) fn write_u64(out: &mut String, value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        if let Some(slot) = digits.get_mut(at) {
+            // `rest % 10` is below 10.
+            *slot = b'0' + (rest % 10) as u8;
+        }
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    out.push_str(core::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or("0"));
+}
+
+/// Appends `value` in decimal.
+#[inline]
+pub(crate) fn write_i64(out: &mut String, value: i64) {
+    if value < 0 {
+        out.push('-');
+    }
+    write_u64(out, value.unsigned_abs());
+}
+
+/// Appends `value` in decimal; 128-bit division only above `u64::MAX`.
+pub(crate) fn write_u128(out: &mut String, value: u128) {
+    if let Ok(small) = u64::try_from(value) {
+        return write_u64(out, small);
+    }
+    let mut digits = [0u8; 39];
+    let mut at = digits.len();
+    let mut rest = value;
+    while rest > 0 {
+        at -= 1;
+        if let Some(slot) = digits.get_mut(at) {
+            *slot = b'0' + (rest % 10) as u8;
+        }
+        rest /= 10;
+    }
+    out.push_str(core::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or("0"));
+}
+
+/// Appends `value` in decimal.
+pub(crate) fn write_i128(out: &mut String, value: i128) {
+    if value < 0 {
+        out.push('-');
+    }
+    write_u128(out, value.unsigned_abs());
+}
+
 /// The shortest round-trip text for a finite `f64`, laid out as described on
 /// [`Number::from_f64`].
+fn format_f64(value: f64) -> Option<String> {
+    let mut out = String::with_capacity(26);
+    write_f64(&mut out, value).then_some(out)
+}
+
+/// Appends the shortest round-trip text for `value`, laid out as described
+/// on [`Number::from_f64`]. Returns `false`, writing nothing, for NaN and
+/// the infinities.
 ///
 /// `core`'s `{:e}` formatting already yields the shortest digit string that
 /// reads back as the same `f64` (it is the same algorithm `Display` uses); this
 /// only moves the decimal point.
-fn format_f64(value: f64) -> Option<String> {
+pub(crate) fn write_f64(out: &mut String, value: f64) -> bool {
     if !value.is_finite() {
-        return None;
+        return false;
     }
     let mut sci = StackText {
         buf: [0; 40],
         len: 0,
     };
-    write!(sci, "{value:e}").ok()?;
-    let sci = core::str::from_utf8(sci.buf.get(..sci.len)?).ok()?;
+    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+}
+
+/// As [`write_f64`] for an `f32`: the shortest text that reads back as the
+/// same `f32` (`0.1f32` is `0.1`, not the `0.10000000149011612` of its
+/// widening to `f64`).
+pub(crate) fn write_f32(out: &mut String, value: f32) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    let mut sci = StackText {
+        buf: [0; 40],
+        len: 0,
+    };
+    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+}
+
+/// Lays out `{:e}` text (`-1.5e-7`) as JSON, decimals for exponents from -5
+/// up to 15 and exponent form otherwise. Writes nothing and returns `false`
+/// if `sci` is not in that form (it always is).
+fn layout(out: &mut String, sci: &StackText) -> bool {
+    let Some(sci) = sci
+        .buf
+        .get(..sci.len)
+        .and_then(|b| core::str::from_utf8(b).ok())
+    else {
+        return false;
+    };
     let (negative, sci) = match sci.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, sci),
     };
-    let (mantissa, exponent) = sci.split_once('e')?;
-    let exponent: i32 = exponent.parse().ok()?;
+    let Some((mantissa, exponent)) = sci.split_once('e') else {
+        return false;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return false;
+    };
     // `{:e}` writes one digit before the point.
     let (lead, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-
-    let mut out = String::with_capacity(26);
     if negative {
         out.push('-');
     }
@@ -313,16 +438,17 @@ fn format_f64(value: f64) -> Option<String> {
             out.push_str(lead);
             if frac.len() <= point {
                 out.push_str(frac);
-                zeros(&mut out, point - frac.len());
+                zeros(out, point - frac.len());
                 out.push_str(".0");
             } else {
-                out.push_str(frac.get(..point)?);
+                let (int, rest) = frac.split_at_checked(point).unwrap_or((frac, ""));
+                out.push_str(int);
                 out.push('.');
-                out.push_str(frac.get(point..)?);
+                out.push_str(rest);
             }
         } else {
             out.push_str("0.");
-            zeros(&mut out, exponent.unsigned_abs() as usize - 1);
+            zeros(out, exponent.unsigned_abs() as usize - 1);
             out.push_str(lead);
             out.push_str(frac);
         }
@@ -332,11 +458,11 @@ fn format_f64(value: f64) -> Option<String> {
             out.push('.');
             out.push_str(frac);
         }
-        write!(out, "e{exponent}").ok()?;
+        out.push('e');
+        write_i64(out, i64::from(exponent));
     }
-    Some(out)
+    true
 }
-
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
@@ -390,7 +516,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_integer_writers_match_core_formatting() {
+        let mut out = String::new();
+        for n in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            12_345,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            out.clear();
+            write_u64(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [0i64, -1, 1, i64::MIN, i64::MAX, -1_000_000] {
+            out.clear();
+            write_i64(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [
+            0u128,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) + 1,
+            u128::MAX,
+        ] {
+            out.clear();
+            write_u128(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [i128::MIN, i128::MAX, -1, 0] {
+            out.clear();
+            write_i128(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        assert_eq!(Number::from(isize::MIN).as_i64(), Some(isize::MIN as i64));
+        assert_eq!(Number::from(usize::MAX).as_u64(), Some(usize::MAX as u64));
+    }
+
+    #[test]
+    fn test_f32_is_shortest_for_f32() {
+        let mut out = String::new();
+        assert!(write_f32(&mut out, 0.1));
+        assert_eq!(out, "0.1");
+        out.clear();
+        assert!(write_f32(&mut out, 1.0e20));
+        assert_eq!(out, "1e20");
+        assert!(!write_f32(&mut out, f32::NAN));
+        assert!(!write_f64(&mut out, f64::INFINITY));
+    }
+
     proptest! {
+        #[test]
+        fn prop_f32_text_round_trips(bits in any::<u32>()) {
+            let x = f32::from_bits(bits);
+            prop_assume!(x.is_finite());
+            let mut out = String::new();
+            prop_assert!(write_f32(&mut out, x));
+            prop_assert!(lexer::is_number(&out), "{}", out);
+            prop_assert_eq!(out.parse::<f32>().map(f32::to_bits).ok(), Some(x.to_bits()));
+        }
+
+        #[test]
+        fn prop_integer_writers_match_core(n in any::<i128>()) {
+            let mut out = String::new();
+            write_i128(&mut out, n);
+            prop_assert_eq!(out, alloc::format!("{n}"));
+        }
+
         #[test]
         fn prop_f64_text_is_valid_and_round_trips(bits in any::<u64>()) {
             let x = f64::from_bits(bits);

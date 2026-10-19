@@ -1,9 +1,14 @@
 //! The writer: deterministic compact and pretty output with complete escaping.
 
 use alloc::{borrow::Cow, string::String};
-use core::{convert::Infallible, fmt, slice};
+use core::{fmt, slice};
 
-use crate::{Value, scan, tree::Member};
+use crate::{
+    ToJson, Value,
+    encode::{Keep, Out, ValueWriter, Written},
+    scan,
+    tree::Member,
+};
 
 /// Spaces for indentation, copied in slices.
 const SPACES: &str = "                                                                ";
@@ -86,9 +91,11 @@ pub fn write_string(out: &mut String, text: &str) {
 
 /// Serializes `value` as compact JSON: no whitespace at all.
 ///
-/// The output is deterministic: members in their order, numbers as their exact
-/// text, strings escaped as [`write_string`] describes. Parsing it gives back
-/// a value equal to `value`.
+/// `value` is anything that implements [`ToJson`]: a [`Value`], or your own
+/// type, written straight to text without building a `Value`. The output is
+/// deterministic: members in their order, numbers as their exact text,
+/// strings escaped as [`write_string`] describes. For a `Value`, parsing the
+/// output gives back an equal value.
 ///
 /// # Examples
 ///
@@ -97,9 +104,10 @@ pub fn write_string(out: &mut String, text: &str) {
 ///
 /// let v = json!({ "id": 1, "tags": ["a", "b"], "none": null });
 /// assert_eq!(to_string(&v), r#"{"id":1,"tags":["a","b"],"none":null}"#);
+/// assert_eq!(to_string(&[Some(1), None]), "[1,null]");
 /// ```
 #[must_use]
-pub fn to_string(value: &Value<'_>) -> String {
+pub fn to_string<T: ToJson + ?Sized>(value: &T) -> String {
     let mut out = String::new();
     write_value(&mut out, value);
     out
@@ -118,7 +126,7 @@ pub fn to_string(value: &Value<'_>) -> String {
 /// assert_eq!(to_string_pretty(&v), "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {}\n}");
 /// ```
 #[must_use]
-pub fn to_string_pretty(value: &Value<'_>) -> String {
+pub fn to_string_pretty<T: ToJson + ?Sized>(value: &T) -> String {
     let mut out = String::new();
     write_value_pretty(&mut out, value);
     out
@@ -136,8 +144,8 @@ pub fn to_string_pretty(value: &Value<'_>) -> String {
 /// write_value(&mut out, &json!([true]));
 /// assert_eq!(out, "Content: [true]");
 /// ```
-pub fn write_value(out: &mut String, value: &Value<'_>) {
-    let Ok(()) = emit::<Infallible>(out, value, false, usize::MAX, &mut |_| Ok(()));
+pub fn write_value<T: ToJson + ?Sized>(out: &mut String, value: &T) {
+    write_to(out, value, false);
 }
 
 /// Appends `value` to `out` as indented JSON (see [`to_string_pretty`]).
@@ -151,8 +159,21 @@ pub fn write_value(out: &mut String, value: &Value<'_>) {
 /// write_value_pretty(&mut out, &json!([1]));
 /// assert_eq!(out, "[\n  1\n]");
 /// ```
-pub fn write_value_pretty(out: &mut String, value: &Value<'_>) {
-    let Ok(()) = emit::<Infallible>(out, value, true, usize::MAX, &mut |_| Ok(()));
+pub fn write_value_pretty<T: ToJson + ?Sized>(out: &mut String, value: &T) {
+    write_to(out, value, true);
+}
+
+/// Writes `value` into `out`, which is never handed anywhere else.
+fn write_to<T: ToJson + ?Sized>(out: &mut String, value: &T, pretty: bool) {
+    let mut keep = Keep;
+    let writer = ValueWriter::new(Out {
+        buf: out,
+        sink: &mut keep,
+        flush_at: usize::MAX,
+        pretty,
+        depth: 0,
+    });
+    let Written(()) = value.to_json(writer);
 }
 
 /// Writes `value` as compact JSON to an [`io::Write`](std::io::Write),
@@ -173,7 +194,10 @@ pub fn write_value_pretty(out: &mut String, value: &Value<'_>) {
 /// ```
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub fn to_writer<W: std::io::Write>(writer: W, value: &Value<'_>) -> std::io::Result<()> {
+pub fn to_writer<W: std::io::Write, T: ToJson + ?Sized>(
+    writer: W,
+    value: &T,
+) -> std::io::Result<()> {
     write_io(writer, value, false)
 }
 
@@ -194,28 +218,42 @@ pub fn to_writer<W: std::io::Write>(writer: W, value: &Value<'_>) -> std::io::Re
 /// ```
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub fn to_writer_pretty<W: std::io::Write>(writer: W, value: &Value<'_>) -> std::io::Result<()> {
+pub fn to_writer_pretty<W: std::io::Write, T: ToJson + ?Sized>(
+    writer: W,
+    value: &T,
+) -> std::io::Result<()> {
     write_io(writer, value, true)
 }
 
+/// How much output the streaming writers collect before passing it on.
 #[cfg(feature = "std")]
-fn write_io<W: std::io::Write>(
+pub(crate) const CHUNK: usize = 8 * 1024;
+
+#[cfg(feature = "std")]
+fn write_io<W: std::io::Write, T: ToJson + ?Sized>(
     mut writer: W,
-    value: &Value<'_>,
+    value: &T,
     pretty: bool,
 ) -> std::io::Result<()> {
-    const CHUNK: usize = 8 * 1024;
     let mut buf = String::with_capacity(CHUNK + 256);
-    emit(&mut buf, value, pretty, CHUNK, &mut |chunk: &mut String| {
-        let result = writer.write_all(chunk.as_bytes());
-        chunk.clear();
-        result
-    })?;
-    writer.write_all(buf.as_bytes())
+    let mut sink = crate::encode::IoSink {
+        writer: &mut writer,
+        error: None,
+    };
+    let out = Out {
+        buf: &mut buf,
+        sink: &mut sink,
+        flush_at: CHUNK,
+        pretty,
+        depth: 0,
+    };
+    let Written(()) = value.to_json(ValueWriter::new(out));
+    crate::encode::Flush::flush(&mut sink, &mut buf);
+    sink.error.map_or(Ok(()), Err)
 }
 
 /// Appends a newline and the indentation for `depth` levels.
-fn newline(out: &mut String, depth: usize) {
+pub(crate) fn newline(out: &mut String, depth: usize) {
     out.push('\n');
     let mut width = depth.saturating_mul(INDENT);
     while width > 0 {
@@ -232,14 +270,16 @@ enum Open<'r, 'a> {
 }
 
 /// Writes `value` into `out`, handing `out` to `flush` whenever it holds at
-/// least `flush_at` bytes (the flush is expected to empty it).
+/// least `flush_at` bytes (the flush is expected to empty it). In the pretty
+/// layout, the value starts at indentation level `base`.
 ///
 /// Iterative: an explicit stack of open containers replaces recursion, so any
 /// depth is safe.
-fn emit<E>(
+pub(crate) fn emit<E>(
     out: &mut String,
     value: &Value<'_>,
     pretty: bool,
+    base: usize,
     flush_at: usize,
     flush: &mut dyn FnMut(&mut String) -> Result<(), E>,
 ) -> Result<(), E> {
@@ -287,7 +327,7 @@ fn emit<E>(
             };
             let _closed = stack.pop();
             if pretty {
-                newline(out, depth - 1);
+                newline(out, base + depth - 1);
             }
             out.push(close);
             continue;
@@ -297,7 +337,7 @@ fn emit<E>(
         }
         *first = false;
         if pretty {
-            newline(out, depth);
+            newline(out, base + depth);
         }
         if let Some(key) = key {
             write_string(out, key);
@@ -325,6 +365,7 @@ impl fmt::Display for Value<'_> {
             &mut buf,
             self,
             f.alternate(),
+            0,
             CHUNK,
             &mut |chunk: &mut String| {
                 let result = f.write_str(chunk);
