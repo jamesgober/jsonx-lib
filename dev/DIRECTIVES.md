@@ -49,7 +49,7 @@ LexerSketch's LSP, DAP, MCP servers and its emitters all speak JSON, and the fam
 ## 4. Project-specific invariants
 
 - Accepts exactly RFC 8259 (property-tested against a reference grammar); rejects everything else with a byte offset.
-- Writer output always parses back to the same value (round-trip property).
+- Writer output always parses back to the same value (round-trip property), for objects without repeated keys: writing a key twice is the caller's to avoid, and the writers document that they do not check it.
 - Budgets on depth, total size, string length, and number length are enforced before allocation; hostile input never panics or overflows the stack.
 - Escaping is complete: no input string can alter the structure of emitted JSON.
 

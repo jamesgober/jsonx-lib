@@ -399,7 +399,8 @@ struct Scratch {
 /// Children of every open container sit on one shared value stack; when a
 /// container closes, its children are moved off the top into a vector of
 /// exactly their size, except the outermost array, which takes the stack
-/// itself. Nothing recurses, and no container's vector ever grows by
+/// itself. Nothing recurses, and no container's vector other than that
+/// outermost one (the value stack, which grows by doubling) ever grows by
 /// reallocation. What the build holds is charged against `max_memory`
 /// before it is allocated (see [`Limits`]).
 pub(crate) fn build<'a>(

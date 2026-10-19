@@ -66,14 +66,16 @@
 //! - **Exact numbers.** A [`Number`] keeps its text; conversion to a Rust
 //!   number happens when asked and never rounds silently into an integer.
 //! - **Budgets.** Depth, input size, string length, number length, value
-//!   count, and the memory a parse holds for its tree are all bounded
+//!   count, and the memory one read holds for what it builds (a tree or
+//!   typed values) are all bounded
 //!   ([`Limits`]), each checked before the memory it guards is used.
 //! - **No recursion on depth.** Parsing, the readers, writing, cloning,
 //!   comparing, and hashing loop over explicit stacks; dropping recurses at
 //!   most a fixed 32 levels. A million levels of nesting cannot overflow the
 //!   stack. (A [`FromJson`] or [`ToJson`] impl for a recursive type of your
 //!   own recurses; the depth budget bounds that on the reading side.)
-//! - **Round trip.** Written output parses back to an equal value, in every
+//! - **Round trip.** Written output parses back to an equal value (for
+//!   objects without repeated keys, which the writers do not check), in every
 //!   [`Format`], and no string can break out of its quotes ([`write_string`]).
 //! - **No panics** on any input, and `#![forbid(unsafe_code)]`.
 //!

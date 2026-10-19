@@ -193,6 +193,11 @@ impl Buffer<'_> {
 /// on the last of the output. Escaping and layout are done for you, as for
 /// [`to_string_with`](crate::to_string_with).
 ///
+/// Keys are not checked for repeats (that would mean keeping every key of
+/// every open object): writing the same key twice in one object is
+/// grammatical JSON that this crate's default parser refuses, so a caller
+/// whose keys come from input should make them unique.
+///
 /// # Examples
 ///
 /// ```
@@ -471,7 +476,8 @@ impl<'o> Writer<'o> {
         self.close(false)
     }
 
-    /// Writes an object member's key; its value comes next.
+    /// Writes an object member's key; its value comes next. A key already
+    /// written in the same object is not refused (see [`Writer`]).
     ///
     /// # Errors
     ///

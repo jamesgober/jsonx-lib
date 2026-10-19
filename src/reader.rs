@@ -81,9 +81,13 @@ pub enum Event<'a> {
 /// [`Event::EndObject`]: the reader returns [`ErrorKind::DuplicateKey`] at
 /// the repeat's opening quote instead. A loop that collects members and acts
 /// only after the object ended (as below) can therefore never act on a
-/// smuggled second value. To check, the reader keeps each open object's keys
-/// (a slice of the input, or a decoded copy for a key with escapes) until
-/// the object closes. Under the other policies the reader passes every
+/// smuggled second value. To check, the reader keeps, for each key of the
+/// objects still open, its offset and a one-word fingerprint of its decoded
+/// text; an object whose fingerprints may match, or with more than 16 keys,
+/// has its keys read again from the input (and decoded where escaped) when
+/// it closes, and compared as text. (A [`StreamReader`](crate::StreamReader),
+/// whose input's front is dropped as it is read, keeps a decoded copy of
+/// each key instead.) Under the other policies the reader passes every
 /// member through as written; [`read_value`](Self::read_value) applies
 /// `First` and `Last` to the values it builds.
 ///

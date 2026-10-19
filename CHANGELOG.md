@@ -25,9 +25,13 @@ budget, `json!` for large literals, fuzzing.
 
 - **Write functions are generic.** `to_string`, `to_string_pretty`,
   `write_value`, `write_value_pretty`, `to_writer`, and `to_writer_pretty`
-  take `&T` where `T: ToJson + ?Sized` instead of `&Value<'_>`. Calls compile
-  unchanged (`Value` implements `ToJson`); only a use as a function pointer
-  (`to_string as fn(&Value) -> String`) needs a closure.
+  take `&T` where `T: ToJson + ?Sized` instead of `&Value<'_>`. Ordinary
+  calls compile unchanged (`Value` implements `ToJson`). Three forms do
+  not: a use as a function pointer (`to_string as fn(&Value) -> String`)
+  needs a closure; a turbofish on the writer type (`to_writer::<W>(w, &v)`)
+  now names two parameters (`to_writer::<W, Value>`, or leave it out); and
+  an argument whose type was inferred from `&Value<'_>`
+  (`to_string(&x.into())`) needs the type spelled (`to_string(&Value::from(x))`).
 - **Duplicate keys are refused by the `Reader` too.** Under the default
   `DuplicateKeys::Error`, a `Reader`'s events and `read_raw` refuse an object
   that repeats a key (`ErrorKind::DuplicateKey` at the repeat's quote, in
@@ -35,7 +39,8 @@ budget, `json!` for large literals, fuzzing.
   on a raw event loop seeing every member must ask for it:
   `Parser::new().duplicate_keys(DuplicateKeys::KeepAll).reader(text)`.
 - **Smaller default budgets.** `Limits::new()` allows 1 Mi values (was 4 Mi)
-  and adds `max_memory` (64 MiB) on what a parse holds for its tree. A
+  and adds `max_memory` (64 MiB) on what a read holds for what it builds
+  (a tree, or typed values). A
   document that parsed under the 0.2 defaults but holds more than 1 Mi values
   or 64 MiB of tree now needs `with_max_elements` / `with_max_memory`.
 - **New `ErrorKind` variants** `MemoryLimitExceeded` and `InputAfterEnd`
@@ -143,8 +148,10 @@ budget, `json!` for large literals, fuzzing.
 - The outermost array of a parse becomes its value in place, without a copy
   of its items.
 - `json!` takes single-token items up to 32 at a time and literal-keyed
-  members up to 16 at a time: literals of thousands of items fit the default
-  recursion limit (it failed at 63 array items and 42 members).
+  members up to 16 at a time: literals of thousands of such items fit the
+  default recursion limit (it failed at 63 array items and 42 members).
+  Items or member values that are expressions of several tokens (`x + 1`)
+  still cost a level per token, so a literal holds a few dozen of those.
 - The crate root also denies `warnings` and `clippy::unreachable`.
 
 ### Fixed
@@ -152,9 +159,13 @@ budget, `json!` for large literals, fuzzing.
 - The `Reader` let a repeated key through (the last value won) where `parse`
   refused it, so the documented JSON-RPC envelope loop could be handed a
   smuggled second `method` (audit JX-SEC-02).
-- The default budgets allowed a parse to hold 32 times its input: 256 MiB of
-  heap from 8 MiB of `[0,0,...]` (audit JX-SEC-01). The memory budget, the
-  in-place outermost array, and the smaller element budget bound it.
+- The default budgets allowed a parse to hold 32 times its input with no
+  ceiling: 256 MiB of heap from 8 MiB of `[0,0,...]` (audit JX-SEC-01). The
+  memory budget now caps what one read of a document holds, trees and typed
+  values alike, at `max_memory` (64 MiB by default), whatever the input's
+  size; the in-place outermost array and the smaller element budget lower
+  the cost further. The cap is absolute, not a ratio: a small input can
+  still build a tree many times its size, up to the cap.
 - A deduplicated object (`First`/`Last`) grew its member vector by
   reallocation; it is now sized exactly.
 - `tests/api.rs` assumed a 64-bit `usize`; the suite now passes on 32-bit

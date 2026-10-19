@@ -169,7 +169,8 @@ assert_eq!(err.line_col(text), (1, 13));
 
 [`Limits`](#limits) bounds what a document may cost: nesting depth, input
 bytes, bytes of any one string or key, bytes of any one number, the total
-count of values, and the memory a parse holds for the tree it builds. Each is
+count of values, and the memory one read holds for what it builds (a tree, or
+typed values: one count per document). Each is
 checked before the memory it guards is allocated: an 8 MiB string over a
 1 KiB budget is refused with under 1 KiB allocated (a counting-allocator
 test checks it), and a string within budget is decoded into one buffer sized
@@ -191,7 +192,8 @@ implementation. Readers that disagree about them are a known way to smuggle
 one value past a validator and another past the consumer, so the default
 [`DuplicateKeys::Error`](#duplicatekeys) refuses them, on every way of
 reading: [`parse`](#parse), a [`Reader`](#reader)'s events and raw slices,
-the [`StreamReader`](#streamreader-and-step), and typed reads. The check
+the [`StreamReader`](#streamreader-and-step), typed reads, and
+[`find_pointer`](#reader) lookups. The check
 happens when an object closes, so a loop over a `Reader`'s events sees the
 error in place of the object's `}`, before it can act on a smuggled second
 value. Keys are compared after unescaping. Each key is fingerprinted as it
@@ -200,8 +202,10 @@ fingerprints, which are compared one by one only when the filter says one may
 match (for objects of up to 16 keys); an object whose fingerprints collide,
 or with more keys, is checked by sorting (`O(n log n)`). For a message of
 ordinary shape (8 open objects, 16 of their keys) this state is kept inline
-in the reader, so the check allocates nothing. `First`, `Last`, and `KeepAll`
-are available as opt-ins.
+in the reader, so the check allocates nothing; past that its state (about 56
+bytes per open key) is held to `max_memory`. The writers do not check keys
+for repeats: an object written with a key twice is refused when read back.
+`First`, `Last`, and `KeepAll` are available as opt-ins.
 
 ### No recursion
 
@@ -315,7 +319,9 @@ Compact JSON, no whitespace, for a [`Value`](#value) or any
 [`ToJson`](#typed-writing-tojson) type (written directly, no tree built).
 Deterministic: members in order, numbers as their exact (or shortest
 round-trip) text, strings escaped as [`write_string`](#write_string)
-describes. For a `Value`, the output parses back to an equal value.
+describes. For a `Value`, the output parses back to an equal value (a
+`Value` built with a repeated key, which `json!` and `Object::push` allow,
+writes it twice, and the default parser refuses that).
 
 ```rust
 let v = jsonx_lib::json!({ "id": 1, "tags": ["a"] });
@@ -407,7 +413,7 @@ pub struct Limits {
 | `max_string_bytes` | 16 MiB | source bytes between a string's quotes, keys included (an escape counts at its written length) | `StringTooLong` at the opening quote |
 | `max_number_bytes` | 1 KiB | bytes of a number's text | `NumberTooLong` at the number's first byte |
 | `max_elements` | 1 Mi | values: every scalar, array, and object counts one; keys do not. Per document in a sequence | `TooManyElements` at the value that went over |
-| `max_memory` | 64 MiB | heap a parse holds for its tree and working stacks (see [Budgets](#budgets)) | `MemoryLimitExceeded` at the value whose storage went over |
+| `max_memory` | 64 MiB | heap one read of a document holds: a parse's tree and working stacks, or a typed decode's values (see [Budgets](#budgets)) | `MemoryLimitExceeded` at the value whose storage went over |
 
 The depth default matches `serde_json`'s recursion limit. `max_memory`
 counts buffers at their capacity, checked before a stack grows (the moment
@@ -1221,7 +1227,7 @@ converted with `Value::from`. A key is a string literal or a parenthesized
 expression that converts into `Cow<str>`. Members are appended in order, so a
 repeated key appears twice. An expression with a top-level comma must be
 parenthesized. Single-token items go up to 32 at a time and literal-keyed
-members up to 16 at a time, so literals of thousands of items fit the default
+members up to 16 at a time, so literals of thousands of such items fit the default
 `recursion_limit` (2,000 items and 1,000 members are tested); two-token items
 (a negative number) go eight at a time; longer items cost a level per token,
 so a literal holds a few dozen of those.
@@ -1254,7 +1260,10 @@ pub struct Format { /* layout, escaping */ }
 | `const fn ascii(self, bool)` | Escape every non-ASCII character (surrogate pairs above U+FFFF). |
 | `const fn is_pretty(&self)` | Whether indented. |
 
-Every format writes valid JSON that reads back as the same value.
+Every format writes valid JSON that reads back as the same value, raw
+values included (see [`RawValue`](#rawvalue)), for objects without repeated
+keys: neither the value writers nor the [`Writer`](#writer) check keys for
+repeats.
 
 ```rust
 use jsonx_lib::{json, to_string_with, Format};

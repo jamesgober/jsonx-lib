@@ -21,7 +21,7 @@
         <strong>jsonx-lib</strong> reads and writes JSON to the RFC 8259 grammar. The parser borrows strings and numbers straight from the input, keeps every number as its exact text, and refuses anything that is not JSON with the byte offset of the mistake. Pull and incremental readers walk a document as events, hand back any value as its raw source text, or read it straight into your own types through hand-written <code>FromJson</code> impls, borrowing strings from the input. <code>ToJson</code> writes your types straight to text, and a checked push writer streams any document out. The writers are deterministic, and their escaping cannot be broken out of by any string.
     </p>
     <p>
-        Budgets on depth, input size, string length, number length, value count, and the memory a parse holds are checked before the memory they guard is allocated, duplicate keys are refused on every way of reading, and nothing in the crate recurses on nesting depth, so hostile input can exhaust neither memory nor the stack. It has no dependencies.
+        Budgets on depth, input size, string length, number length, value count, and the memory one read holds (a tree or typed values, 64 MiB by default) are checked before the memory they guard is allocated, duplicate keys are refused on every way of reading, and nothing in the crate recurses on nesting depth, so a hostile document cannot make a read hold more than its budget, nor overflow the stack. It has no dependencies.
     </p>
     <br>
     <hr>
@@ -57,9 +57,9 @@ What it guarantees, and how each guarantee is checked:
 | The RFC 8259 grammar; everything outside it refused at the first byte that cannot continue a valid text. Lone surrogate escapes, and (by default) repeated keys, are refused by choice. | Property tests run random token soup and mutated documents through the crate and an independent strict reference parser written from the RFC grammar: verdict, value, and exact error offset agree. 234 JSONTestSuite-style cases written as data (73 accept, 127 refuse, 34 implementation-defined) pin the kind and offset of every refusal. |
 | Every way of reading agrees: parse, events, raw slices, the incremental reader at any chunking, typed reads. | Properties compare the incremental reader with the complete one for every mix of calls and chunk boundaries, and every reading path's duplicate-key refusals with `parse`'s. |
 | Duplicate keys cannot smuggle a second value. | Refused by default on every reading path, compared after unescaping, in `O(n log n)`; the documented JSON-RPC `Reader` loop sees the error at the object's `}`. Every policy is checked against a naive reference. |
-| Written output parses back to the same value, in every format. | Round-trip properties over arbitrary documents, compact, pretty, indented, HTML-safe, and ASCII-only, checked by both parsers; typed output matches the `Value` output it stands for. |
+| Written output parses back to the same value, in every format (for objects without repeated keys: the writers do not check keys for repeats). | Round-trip properties over arbitrary documents, compact, pretty, indented, HTML-safe, and ASCII-only, checked by both parsers; typed output matches the `Value` output it stands for. |
 | No string can change the structure of the output. | Arbitrary strings (rich in quotes, backslashes, control characters, U+2028/U+2029) written as values and keys always read back, under the reference parser, as exactly themselves. |
-| Budgets refuse before allocating; a parse holds at most `max_memory` (64 MiB by default). | A counting allocator measures peak heap: an 8 MiB string over a 1 KiB budget is refused with under 1 KiB allocated; over-size input with none; five hostile document shapes (flat, nested, pairs, members, escapes) stay within `max_memory` under the defaults. |
+| Budgets refuse before allocating; a read of a document, tree or typed values, holds at most about `max_memory` (64 MiB by default). | A counting allocator measures peak heap: an 8 MiB string over a 1 KiB budget is refused with under 1 KiB allocated; over-size input with none; five hostile document shapes (flat, nested, pairs, members, escapes) stay within `max_memory` under the defaults. |
 | No stack overflow, no panic. | A million levels of nesting parse, write, transcode, clone, compare, and drop on a thread with a 256 KiB stack. Five cargo-fuzz targets cover every reading entry point with these oracles (no counterexample in about 4.0 M runs of the smoke pass), and the same checks run on arbitrary bytes in `cargo test` on every platform. |
 
 <hr>
@@ -237,7 +237,7 @@ On the 1 MiB benchmark document (`cargo bench --bench bench`): `parse` about
 220 MiB/s, events about 510 MiB/s, `read_raw` about 610 MiB/s, `to_string`
 about 1.05 GiB/s, typed decoding into structs about 300 MiB/s, and the
 incremental reader about 395 MiB/s. Typed decoding of a small request is
-about twice serde_json's derive and allocates nothing. Method and every
+2.3 to 2.6 times serde_json's derive (median about 2.5) and allocates nothing. Method and every
 number: [the release notes](./docs/release/v0.5.0.md#benchmarks).
 
 <hr>
