@@ -286,3 +286,87 @@ fn million_deep_transcoding_through_the_push_writer_is_iterative() {
         assert_eq!(out, text);
     });
 }
+
+#[test]
+fn test_unterminated_string_within_the_budget_is_unexpected_end() {
+    let max = 4;
+    let p = Parser::new().limits(Limits::new().with_max_string_bytes(max));
+    // A body of exactly the budget, cut off before its quote.
+    assert_eq!(
+        kind_at(p.parse("\"abcd")),
+        Some((ErrorKind::UnexpectedEnd, 5))
+    );
+    // One byte more is over the budget.
+    assert_eq!(
+        kind_at(p.parse("\"abcde")),
+        Some((ErrorKind::StringTooLong, 0))
+    );
+    // An unterminated string that starts past offset `max`.
+    let late = format!("[{}\"ab", "0, ".repeat(4));
+    assert_eq!(
+        kind_at(p.parse(&late)),
+        Some((ErrorKind::UnexpectedEnd, late.len()))
+    );
+    let late_long = format!("[{}\"abcde", "0, ".repeat(4));
+    assert_eq!(
+        kind_at(p.parse(&late_long)),
+        Some((ErrorKind::StringTooLong, 13))
+    );
+}
+
+#[test]
+fn test_long_invalid_number_late_in_the_input_is_number_too_long() {
+    let p = Parser::new().limits(Limits::new().with_max_number_bytes(3));
+    let pad = "0, ".repeat(10);
+    // Too long wins over the syntax error past the budget...
+    let doc = format!("[{pad}1234.x]");
+    assert_eq!(kind_at(p.parse(&doc)), Some((ErrorKind::NumberTooLong, 31)));
+    // ...but a syntax error within the budget is reported as such.
+    let doc = format!("[{pad}12.x]");
+    assert_eq!(kind_at(p.parse(&doc)), Some((ErrorKind::InvalidNumber, 34)));
+    // Cut short within the budget: the input simply ended.
+    let doc = format!("[{pad}12.");
+    assert_eq!(
+        kind_at(p.parse(&doc)),
+        Some((ErrorKind::UnexpectedEnd, doc.len()))
+    );
+}
+
+#[test]
+fn test_byte_entry_points_at_the_input_budget_accept_exactly_the_budget() {
+    let p = Parser::new().limits(Limits::new().with_max_input_bytes(5));
+    assert!(p.parse_bytes(b"[123]").is_ok());
+    assert!(p.reader_bytes(b"[123]").is_ok());
+    assert_eq!(
+        kind_at(p.parse_bytes(b"[1234]")),
+        Some((ErrorKind::InputTooLarge, 5))
+    );
+    assert_eq!(
+        p.reader_bytes(b"[1234]")
+            .err()
+            .map(|e| (e.kind(), e.offset())),
+        Some((ErrorKind::InputTooLarge, 5))
+    );
+    let mut s = p.stream_reader();
+    assert!(s.feed(b"[12").is_ok() && s.feed(b"3]").is_ok());
+    assert_eq!(
+        s.feed(b" ").err().map(|e| e.kind()),
+        Some(ErrorKind::InputTooLarge)
+    );
+}
+
+#[test]
+fn test_display_into_a_failing_formatter_returns_the_error() {
+    use std::fmt::Write as _;
+
+    struct Full;
+    impl std::fmt::Write for Full {
+        fn write_str(&mut self, _: &str) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+    let big: Value = (0..10_000).map(|i| json!({ "i": i })).collect();
+    assert!(write!(Full, "{big}").is_err());
+    assert!(write!(Full, "{big:#}").is_err());
+    assert!(write!(Full, "{}", json!(1)).is_err());
+}
