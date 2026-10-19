@@ -4,10 +4,10 @@
 # `rustfmt.toml` pins `newline_style = "Unix"`.
 * text=auto eol=lf
 
-# Keep development-only paths out of `git archive` source tarballs.
+# Keep development-only paths out of `git archive` source tarballs. `docs/`
+# stays in: the crate's doctests include `docs/API.md` and `README.md`.
 /.dev             export-ignore
 /.github          export-ignore
-/docs             export-ignore
 /tests            export-ignore
 /.gitignore       export-ignore
 /.editorconfig    export-ignore
