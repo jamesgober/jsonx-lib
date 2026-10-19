@@ -424,6 +424,30 @@ impl Machine {
         }
     }
 
+    /// Enters the object (`object`) or array that starts at the current
+    /// position, as [`step`](Self::step) would: the fast path of a typed
+    /// read, which knows what it wants. `Ok(false)`, with nothing consumed,
+    /// if no such container starts here (or a token is in progress); the
+    /// caller then takes the general path.
+    #[inline]
+    pub(crate) fn enter(&mut self, src: &str, object: bool) -> Result<bool, Error> {
+        if !matches!(self.pending, Pending::None)
+            || !matches!(
+                self.state,
+                State::Value | State::Element | State::ArrayFirst
+            )
+        {
+            return Ok(false);
+        }
+        let bytes = src.as_bytes();
+        let at = scan::skip_whitespace(bytes, self.pos);
+        let want = if object { b'{' } else { b'[' };
+        if bytes.get(at) != Some(&want) {
+            return Ok(false);
+        }
+        self.open(at, object).map(|_| true)
+    }
+
     /// Continues the token recorded in `pending`.
     fn resume<'s>(&mut self, src: &'s str) -> Result<Event<'s>, Error> {
         match core::mem::replace(&mut self.pending, Pending::None) {

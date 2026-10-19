@@ -666,7 +666,6 @@ impl<'a> Reader<'a> {
         Ok(ObjectReader {
             reader: self,
             start,
-            key: Cow::Borrowed(""),
             key_offset: start,
             pending: false,
             done: false,
@@ -728,41 +727,31 @@ impl<'a> Reader<'a> {
     /// Checks that the next value is of `kind` and consumes its first event;
     /// returns its offset.
     fn open(&mut self, kind: Kind, expected: &'static str) -> Result<usize, DecodeError> {
-        let (event, at) = self.value_event(Some(kind), expected)?;
-        match event {
-            Event::StartObject | Event::StartArray => Ok(at),
-            other => Err(DecodeError::wrong_type(expected, event_kind(&other), at)),
+        if self.enter(kind == Kind::Object)? {
+            return Ok(self.event_offset());
         }
-    }
-
-    /// Reads the first event of the next value. When `want` is given and the
-    /// value is of another kind, nothing is consumed and the error is
-    /// [`DecodeErrorKind::WrongType`]; a container is never entered for a
-    /// scalar target.
-    fn value_event(
-        &mut self,
-        want: Option<Kind>,
-        expected: &'static str,
-    ) -> Result<(Event<'a>, usize), DecodeError> {
-        let peeked = self.peek_kind()?;
-        if !self.at_a_value()? {
-            // A container ends, or the document did: there is no value.
-            return Err(DecodeError::new(
-                DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
-                self.offset(),
-            ));
-        }
-        match (want, peeked) {
-            (Some(want), Some(found)) if found != want => {
-                return Err(DecodeError::wrong_type(expected, found, self.offset()));
+        // Looked at before it is read: a value of another type is left
+        // unread.
+        match self.peek_kind()? {
+            Some(found) if found == kind => {}
+            Some(found) => return Err(DecodeError::wrong_type(expected, found, self.offset())),
+            None if !self.at_a_value()? => {
+                // A container ends, or the document did: there is no value.
+                return Err(DecodeError::new(
+                    DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
+                    self.offset(),
+                ));
             }
-            (None, Some(found @ (Kind::Array | Kind::Object))) => {
-                return Err(DecodeError::wrong_type(expected, found, self.offset()));
-            }
-            _ => {}
+            // A byte that cannot start a value: the step below says why.
+            None => {}
         }
         match self.next_event()? {
-            Some(event) => Ok((event, self.event_offset())),
+            Some(Event::StartObject | Event::StartArray) => Ok(self.event_offset()),
+            Some(other) => Err(DecodeError::wrong_type(
+                expected,
+                event_kind(&other),
+                self.event_offset(),
+            )),
             None => Err(Error::new(ErrorKind::UnexpectedEnd, self.offset()).into()),
         }
     }
@@ -817,7 +806,8 @@ fn event_kind(event: &Event<'_>) -> Kind {
 pub struct ObjectReader<'r, 'de> {
     reader: &'r mut Reader<'de>,
     start: usize,
-    key: Cow<'de, str>,
+    /// The current key's opening quote (its text is read again only for an
+    /// error's path).
     key_offset: usize,
     /// A key was read and its value not yet.
     pending: bool,
@@ -854,7 +844,6 @@ impl<'de> ObjectReader<'_, 'de> {
         }
         match self.reader.next_event()? {
             Some(Event::Key(key)) => {
-                self.key = key.clone();
                 self.key_offset = self.reader.event_offset();
                 self.pending = true;
                 Ok(Some(key))
@@ -885,8 +874,9 @@ impl<'de> ObjectReader<'_, 'de> {
     /// assert_eq!(o.value::<u8>().unwrap_err().pointer(), "/n");
     /// # Ok::<(), jsonx_lib::DecodeError>(())
     /// ```
+    #[inline]
     pub fn value<T: FromJson<'de>>(&mut self) -> Result<T, DecodeError> {
-        self.value_with(decode_value)
+        self.value_with(T::from_json)
     }
 
     /// Reads the current member's value with `read`, for a value that needs
@@ -929,7 +919,14 @@ impl<'de> ObjectReader<'_, 'de> {
             }
             Ok(value)
         });
-        result.map_err(|e| e.at_key(&*self.key))
+        result.map_err(|e| self.in_member(e))
+    }
+
+    /// `e` with the current member's key in its path.
+    #[cold]
+    #[inline(never)]
+    fn in_member(&self, e: DecodeError) -> DecodeError {
+        e.at_key(self.reader.key_at(self.key_offset))
     }
 
     /// Reads the current member's value into `slot`, the pattern for a
@@ -965,10 +962,8 @@ impl<'de> ObjectReader<'_, 'de> {
                 DuplicateKeys::First => return self.skip(),
                 DuplicateKeys::Last | DuplicateKeys::KeepAll => {}
                 _ => {
-                    return Err(
-                        DecodeError::new(DecodeErrorKind::DuplicateField, self.key_offset)
-                            .at_key(&*self.key),
-                    );
+                    let e = DecodeError::new(DecodeErrorKind::DuplicateField, self.key_offset);
+                    return Err(self.in_member(e));
                 }
             }
         }
@@ -1015,12 +1010,14 @@ impl<'de> ObjectReader<'_, 'de> {
         self.pending = false;
         match self.reader.read_raw() {
             Ok(Some(text)) => Ok(text),
-            Ok(None) => Err(DecodeError::new(
-                DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
-                self.reader.offset(),
-            )
-            .at_key(&*self.key)),
-            Err(e) => Err(DecodeError::from(e).at_key(&*self.key)),
+            Ok(None) => {
+                let e = DecodeError::new(
+                    DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
+                    self.reader.offset(),
+                );
+                Err(self.in_member(e))
+            }
+            Err(e) => Err(self.in_member(e.into())),
         }
     }
 
@@ -1053,7 +1050,10 @@ impl<'de> ObjectReader<'_, 'de> {
     /// assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("unknown field at byte 9 (at /b)"));
     /// ```
     pub fn unknown_field(&self) -> DecodeError {
-        DecodeError::new(DecodeErrorKind::UnknownField, self.key_offset).at_key(&*self.key)
+        self.in_member(DecodeError::new(
+            DecodeErrorKind::UnknownField,
+            self.key_offset,
+        ))
     }
 
     /// The value of a field read with [`field`](Self::field): `slot`'s
@@ -1860,7 +1860,7 @@ fn members<'de, K: FromJsonKey<'de>, V: FromJson<'de>>(
     let mut object = reader.read_object()?;
     while let Some(text) = object.next_key()? {
         let key = K::from_json_key(text)
-            .map_err(|kind| DecodeError::new(kind, object.key_offset).at_key(&*object.key))?;
+            .map_err(|kind| object.in_member(DecodeError::new(kind, object.key_offset)))?;
         if map.has(&key) {
             match policy {
                 DuplicateKeys::First => {
@@ -1869,11 +1869,8 @@ fn members<'de, K: FromJsonKey<'de>, V: FromJson<'de>>(
                 }
                 DuplicateKeys::Last | DuplicateKeys::KeepAll => {}
                 _ => {
-                    return Err(DecodeError::new(
-                        DecodeErrorKind::DuplicateField,
-                        object.key_offset,
-                    )
-                    .at_key(&*object.key));
+                    let e = DecodeError::new(DecodeErrorKind::DuplicateField, object.key_offset);
+                    return Err(object.in_member(e));
                 }
             }
         }

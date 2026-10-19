@@ -505,6 +505,24 @@ impl<'a> Reader<'a> {
         self.machine.at_value(self.src)
     }
 
+    /// Enters the object (`object`) or array that comes next, if one does:
+    /// see [`Machine::enter`].
+    #[inline]
+    pub(crate) fn enter(&mut self, object: bool) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        self.machine
+            .enter(self.src, object)
+            .inspect_err(|&e| self.failed = Some(e))
+    }
+
+    /// The decoded text of the key whose opening quote is at `quote` (for an
+    /// error's path: the key is read again).
+    pub(crate) fn key_at(&self, quote: usize) -> alloc::string::String {
+        crate::machine::key_text(self.src, quote).into_owned()
+    }
+
     /// The reader's duplicate-key policy.
     #[inline]
     pub(crate) fn duplicate_policy(&self) -> DuplicateKeys {
