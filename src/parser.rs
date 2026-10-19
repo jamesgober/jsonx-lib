@@ -7,6 +7,7 @@ use crate::{
     Array, Limits, Object, Reader, Value, dupes,
     error::{Error, ErrorKind},
     reader::Event,
+    small::SmallStack,
     tree::Member,
 };
 
@@ -405,7 +406,12 @@ pub(crate) fn build<'a>(
 ) -> Result<Value<'a>, Error> {
     let mut values: Vec<Value<'a>> = Vec::new();
     let mut keys: Vec<Cow<'a, str>> = Vec::new();
-    let mut frames: Vec<Frame> = Vec::new();
+    // The open containers: a message's few levels live inline.
+    let mut frames: SmallStack<Frame, 16> = SmallStack::new(Frame {
+        values: 0,
+        keys: 0,
+        start: 0,
+    });
     let mut scratch = Scratch::default();
     let mut budget = Budget {
         max: max_memory,
@@ -438,7 +444,7 @@ pub(crate) fn build<'a>(
                 let Some(frame) = frames.pop() else {
                     return Err(Error::new(ErrorKind::ExpectedValue, at));
                 };
-                if frames.is_empty() && frame.values == 0 {
+                if frames.len() == 0 && frame.values == 0 {
                     // The outermost array: its items are the whole stack,
                     // which becomes the array in place, already counted.
                     let mut items = core::mem::take(&mut values);
@@ -476,7 +482,7 @@ pub(crate) fn build<'a>(
             Event::Bool(b) => Value::Bool(b),
             Event::Null => Value::Null,
         };
-        if frames.is_empty() {
+        if frames.len() == 0 {
             return Ok(value);
         }
         let start = match &value {
