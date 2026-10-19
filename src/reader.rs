@@ -530,6 +530,19 @@ impl<'a> Reader<'a> {
         crate::machine::key_text(self.src, quote).into_owned()
     }
 
+    /// [`at_a_value`](Self::at_a_value) inside an array, with the common
+    /// case (a `,` and an item, or a first item) inline.
+    #[inline]
+    pub(crate) fn at_item(&mut self) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        match self.machine.at_item(self.src) {
+            Some(more) => Ok(more),
+            None => self.machine.at_value(self.src),
+        }
+    }
+
     /// The reader's duplicate-key policy.
     #[inline]
     pub(crate) fn duplicate_policy(&self) -> DuplicateKeys {

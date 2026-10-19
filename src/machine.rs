@@ -331,6 +331,37 @@ impl Machine {
         })
     }
 
+    /// [`at_value`](Self::at_value)'s answer for the common cases inside an
+    /// array, small enough to inline: after an item, a `,` and the next
+    /// item; after the `[`, an item. `None` for anything else, which
+    /// `at_value` then decides.
+    #[inline]
+    pub(crate) fn at_item(&mut self, src: &str) -> Option<bool> {
+        if !matches!(self.pending, Pending::None) {
+            return None;
+        }
+        let bytes = src.as_bytes();
+        let at = scan::skip_whitespace(bytes, self.pos);
+        match (self.state, bytes.get(at)) {
+            (State::ArrayNext, Some(b',')) => {
+                let next = scan::skip_whitespace(bytes, at + 1);
+                match bytes.get(next) {
+                    Some(&b) if b != b']' => {
+                        self.pos = next;
+                        self.state = State::Element;
+                        Some(true)
+                    }
+                    _ => None,
+                }
+            }
+            (State::ArrayFirst, Some(&b)) if b != b']' => {
+                self.pos = at;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// The kind of the value that starts at the current position, if a
     /// value starts there. Call after [`at_value`](Self::at_value) said one
     /// comes next.

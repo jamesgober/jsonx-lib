@@ -1103,11 +1103,12 @@ pub struct ArrayReader<'r, 'de> {
 
 impl<'de> ArrayReader<'_, 'de> {
     /// Whether another item comes; consumes the `]` when not.
+    #[inline(always)]
     fn more(&mut self) -> Result<bool, DecodeError> {
         if self.done {
             return Ok(false);
         }
-        if self.reader.at_a_value()? {
+        if self.reader.at_item()? {
             return Ok(true);
         }
         match self.reader.next_event()? {
@@ -1138,8 +1139,9 @@ impl<'de> ArrayReader<'_, 'de> {
     /// assert_eq!(items.next_item::<u8>().unwrap_err().pointer(), "/1");
     /// # Ok::<(), jsonx_lib::DecodeError>(())
     /// ```
+    #[inline]
     pub fn next_item<T: FromJson<'de>>(&mut self) -> Result<Option<T>, DecodeError> {
-        self.next_with(decode_value)
+        self.next_with(T::from_json)
     }
 
     /// Reads the next item with `read`, or returns `None` after the last.
