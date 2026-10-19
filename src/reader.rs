@@ -422,6 +422,13 @@ impl<'a> Reader<'a> {
     /// # Ok::<(), jsonx_lib::Error>(())
     /// ```
     pub fn finish(mut self) -> Result<(), Error> {
+        self.read_to_end()
+    }
+
+    /// [`finish`](Self::finish) in place, for the crate's own one-call
+    /// functions: the reader is not moved (it is several hundred bytes).
+    #[inline]
+    pub(crate) fn read_to_end(&mut self) -> Result<(), Error> {
         while self.next_event()?.is_some() {}
         Ok(())
     }

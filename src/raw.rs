@@ -77,7 +77,7 @@ impl<'a> RawValue<'a> {
         let mut reader = Reader::new(text);
         match reader.read_raw_value()? {
             Some(raw) => {
-                reader.finish()?;
+                reader.read_to_end()?;
                 Ok(raw)
             }
             // `read_raw` sees no value only in input that holds none.

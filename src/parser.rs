@@ -259,7 +259,7 @@ impl Parser {
         let value = reader
             .read_value()?
             .ok_or(Error::new(ErrorKind::UnexpectedEnd, text.len()))?;
-        reader.finish()?;
+        reader.read_to_end()?;
         Ok(value)
     }
 

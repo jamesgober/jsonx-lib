@@ -1366,7 +1366,7 @@ impl Parser {
     pub fn decode<'de, T: FromJson<'de>>(&self, text: &'de str) -> Result<T, DecodeError> {
         let mut reader = self.reader(text);
         let value = decode_value(&mut reader)?;
-        reader.finish()?;
+        reader.read_to_end()?;
         Ok(value)
     }
 
@@ -1386,7 +1386,7 @@ impl Parser {
     pub fn decode_bytes<'de, T: FromJson<'de>>(&self, bytes: &'de [u8]) -> Result<T, DecodeError> {
         let mut reader = self.reader_bytes(bytes)?;
         let value = decode_value(&mut reader)?;
-        reader.finish()?;
+        reader.read_to_end()?;
         Ok(value)
     }
 }
