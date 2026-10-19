@@ -476,7 +476,8 @@ impl Machine {
         if bytes.get(at) != Some(&want) {
             return Ok(false);
         }
-        self.open(at, object).map(|_| true)
+        // The step opens it (one copy of that code, inlined in the step).
+        self.step(src).map(|_| true)
     }
 
     /// Continues the token recorded in `pending`.
