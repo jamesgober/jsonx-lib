@@ -47,18 +47,44 @@ pub(crate) const fn is_write_special(b: u8) -> bool {
     is_read_special(b) || b == 0xE2
 }
 
+/// The lanes of `x` that may hold a [`is_read_special`] byte; the lowest
+/// set one is the first that does (see the module documentation).
+#[inline(always)]
+const fn read_hits(x: u64) -> u64 {
+    lanes_equal(x, b'"') | lanes_equal(x, b'\\') | lanes_control(x)
+}
+
 /// The index of the first byte at or after `from` in `bytes[..end]` that is
 /// [`is_read_special`], or `end` if there is none.
 #[inline]
 pub(crate) fn find_read_special(bytes: &[u8], from: usize, end: usize) -> usize {
     let end = end.min(bytes.len());
     let mut i = from;
+    // Sixteen bytes per step while there is room: two independent words, so
+    // the CPU tests both at once and branches once.
+    while i + 16 <= end {
+        let Some(pair) = bytes.get(i..).and_then(<[u8]>::first_chunk::<16>) else {
+            break;
+        };
+        let (Some(lo), Some(hi)) = (pair.first_chunk::<8>(), pair.last_chunk::<8>()) else {
+            break;
+        };
+        let lo = read_hits(u64::from_le_bytes(*lo));
+        let hi = read_hits(u64::from_le_bytes(*hi));
+        if lo | hi != 0 {
+            return if lo != 0 {
+                i + (lo.trailing_zeros() / 8) as usize
+            } else {
+                i + 8 + (hi.trailing_zeros() / 8) as usize
+            };
+        }
+        i += 16;
+    }
     while i + 8 <= end {
         let Some(chunk) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) else {
             break;
         };
-        let x = u64::from_le_bytes(*chunk);
-        let hits = lanes_equal(x, b'"') | lanes_equal(x, b'\\') | lanes_control(x);
+        let hits = read_hits(u64::from_le_bytes(*chunk));
         if hits != 0 {
             // `trailing_zeros / 8` is below 8.
             return i + (hits.trailing_zeros() / 8) as usize;
@@ -109,11 +135,46 @@ pub(crate) const fn is_whitespace(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
+/// High bit set in each lane of `x` exactly equal to `byte`: no false
+/// positives, unlike [`lanes_equal`], at the cost of two more operations.
+/// `(v & 0x7F) + 0x7F` sets a lane's high bit exactly when its low seven
+/// bits are not all zero, and cannot carry into the next lane; OR-ing `v`
+/// adds the lane's own high bit. So the high bit stays clear exactly in the
+/// zero lanes.
+#[inline(always)]
+const fn lanes_exactly(x: u64, byte: u8) -> u64 {
+    let v = x ^ (ONES * byte as u64);
+    !(((v & !HIGHS).wrapping_add(!HIGHS)) | v) & HIGHS
+}
+
 /// The index of the first byte at or after `from` that is not JSON
 /// whitespace, or `bytes.len()` if there is none.
+///
+/// Compact JSON has no whitespace or a single space between tokens, so the
+/// first two bytes are checked one at a time; a longer run (indentation in
+/// pretty-printed JSON) is skipped eight bytes at a time.
 #[inline]
 pub(crate) fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
     let mut i = from;
+    for _ in 0..2 {
+        match bytes.get(i) {
+            Some(&b) if is_whitespace(b) => i += 1,
+            _ => return i,
+        }
+    }
+    while let Some(chunk) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) {
+        let x = u64::from_le_bytes(*chunk);
+        let blank = lanes_exactly(x, b' ')
+            | lanes_exactly(x, b'\n')
+            | lanes_exactly(x, b'\t')
+            | lanes_exactly(x, b'\r');
+        let other = !blank & HIGHS;
+        if other != 0 {
+            // `trailing_zeros / 8` is below 8.
+            return i + (other.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
     while bytes.get(i).copied().is_some_and(is_whitespace) {
         i += 1;
     }
@@ -192,7 +253,37 @@ mod tests {
         assert_eq!(hex_digit(0x3F), b'f');
     }
 
+    fn naive_skip(bytes: &[u8], from: usize) -> usize {
+        (from..bytes.len())
+            .find(|&i| !is_whitespace(bytes[i]))
+            .unwrap_or(bytes.len())
+    }
+
+    #[test]
+    fn test_skip_whitespace_each_lane_and_run_length() {
+        for run in 0..40 {
+            for stop in [b'x', 0x00, 0x0B, 0x0C, 0x1F, 0x21, 0x8A, 0xA0, 0xFF] {
+                let mut bytes = Vec::new();
+                for k in 0..run {
+                    bytes.push(b" \n\t\r"[k % 4]);
+                }
+                bytes.push(stop);
+                bytes.extend_from_slice(b"   ");
+                assert_eq!(skip_whitespace(&bytes, 0), run, "run {run} stop {stop:#x}");
+            }
+        }
+        assert_eq!(skip_whitespace(b"        ", 0), 8);
+        assert_eq!(skip_whitespace(b"", 0), 0);
+        assert_eq!(skip_whitespace(b"ab  ", 2), 4);
+    }
+
     proptest! {
+        #[test]
+        fn prop_skip_whitespace_matches_naive(bytes in proptest::collection::vec(prop_oneof![Just(b' '), Just(b'\n'), Just(b'\t'), Just(b'\r'), any::<u8>()], 0..80), from in 0usize..80) {
+            let from = from.min(bytes.len());
+            prop_assert_eq!(skip_whitespace(&bytes, from), naive_skip(&bytes, from));
+        }
+
         #[test]
         fn prop_swar_scans_match_naive(bytes in proptest::collection::vec(any::<u8>(), 0..64), from in 0usize..64, end in 0usize..70) {
             let from = from.min(bytes.len());
