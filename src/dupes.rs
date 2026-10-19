@@ -28,7 +28,7 @@ pub(crate) fn has_duplicates<'k>(
         // At most 120 one-word comparisons.
         let mut prints = [0u64; PAIRWISE];
         for (i, slot) in prints.iter_mut().take(n).enumerate() {
-            *slot = fingerprint(key(i));
+            *slot = fingerprint(key(i).as_bytes());
         }
         let prints = prints.get(..n).unwrap_or(&[]);
         let any = prints.iter().enumerate().skip(1).any(|(i, a)| {
@@ -52,15 +52,21 @@ pub(crate) fn has_duplicates<'k>(
 }
 
 /// A cheap summary of a key: equal keys have equal fingerprints. The length
-/// and the first eight bytes, which tell most distinct keys apart.
+/// and the first and last eight bytes, which tell most distinct keys apart
+/// (including the `item1`/`item2` kind that share a long prefix).
 #[inline]
-fn fingerprint(key: &str) -> u64 {
-    let bytes = key.as_bytes();
-    let mut head = [0u8; 8];
-    for (slot, &b) in head.iter_mut().zip(bytes) {
-        *slot = b;
-    }
-    u64::from_le_bytes(head) ^ (bytes.len() as u64).rotate_left(56)
+pub(crate) fn fingerprint(bytes: &[u8]) -> u64 {
+    let (head, tail) = match (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        (Some(head), Some(tail)) => (u64::from_le_bytes(*head), u64::from_le_bytes(*tail)),
+        _ => {
+            let mut short = [0u8; 8];
+            if let Some(slot) = short.get_mut(..bytes.len()) {
+                slot.copy_from_slice(bytes);
+            }
+            (u64::from_le_bytes(short), 0)
+        }
+    };
+    head ^ tail.rotate_left(29) ^ (bytes.len() as u64).rotate_left(56)
 }
 
 /// Calls `f(run)` for each run of equal keys in the sorted `order` (each run

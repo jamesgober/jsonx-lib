@@ -57,7 +57,7 @@ impl StrScan {
 /// Nothing is decoded or allocated here: a string with escapes is validated in
 /// this pass and decoded by [`decode`] in a second, so the decoder can size its
 /// buffer exactly, and only after the length budget has passed.
-#[cfg(test)]
+#[inline]
 pub(crate) fn scan_string(bytes: &[u8], quote: usize, max: usize) -> Result<StrToken, Error> {
     resume_string(bytes, quote, &mut StrScan::start(quote), max)
 }
@@ -67,6 +67,7 @@ pub(crate) fn scan_string(bytes: &[u8], quote: usize, max: usize) -> Result<StrT
 /// checked, so a later call over a longer input picks up there: a string fed
 /// in pieces is scanned once, plus at most the eleven bytes of an escape cut
 /// in half.
+#[inline(always)]
 pub(crate) fn resume_string(
     bytes: &[u8],
     quote: usize,

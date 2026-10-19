@@ -81,35 +81,36 @@ enum Pending {
     Literal { start: usize },
 }
 
-/// One key of an object still open, kept to check for duplicates.
-#[derive(Clone, Copy, Debug)]
-struct KeyEntry {
-    /// The key's opening quote, where a duplicate is reported.
-    quote: usize,
-    /// The decoded key text: `start..start + len` of the arena, or of the
-    /// input text when `in_text`.
-    start: usize,
-    len: usize,
-    in_text: bool,
-}
-
 /// An object still open whose keys are being kept.
 #[derive(Clone, Copy, Debug)]
 struct OpenObject {
-    /// Its first key in `Machine::keys`.
+    /// Its first key in `Machine::quotes` and `Machine::prints`.
     keys: usize,
-    /// The arena's length when it opened.
+    /// Its first copy in `Machine::copies`, and the arena's length, when it
+    /// opened.
+    copies: usize,
     arena: usize,
+    /// Two keys may be equal (their fingerprints are), or the object is too
+    /// big to have compared them as they came: check when it closes.
+    suspect: bool,
 }
+
+/// Objects with more keys than this are checked by sorting when they close;
+/// smaller ones compare each new key's fingerprint as it is read.
+const COMPARE_AS_READ: usize = 16;
 
 /// The reader's position in the grammar, with its budgets. See the module
 /// documentation.
 ///
-/// Under [`DuplicateKeys::Error`] the machine also keeps the keys of every
-/// open object (a slice of the text, or a decoded copy for a key with
-/// escapes) and refuses a repeated key when the object closes, at the
-/// repeat's opening quote: the same check, at the same point, as the tree
-/// builder made in 0.2, now applied to every way of reading.
+/// Under [`DuplicateKeys::Error`] the machine also refuses a repeated key
+/// when its object closes, at the repeat's opening quote: the same check, at
+/// the same point, as the tree builder made in 0.2, now applied to every way
+/// of reading. For each key of an open object it keeps the key's offset and
+/// a one-word fingerprint, compared with the object's earlier keys as it
+/// arrives; only an object where two fingerprints match (or with more than
+/// [`COMPARE_AS_READ`] keys) has its keys read again and compared as text
+/// when it closes. Over a text whose front is dropped as it is read
+/// (`copy_keys`), each key's decoded text is copied as well.
 #[derive(Clone, Debug)]
 pub(crate) struct Machine {
     /// The offset just past the input consumed so far.
@@ -130,7 +131,13 @@ pub(crate) struct Machine {
     /// whose front is dropped as it is read).
     pub(crate) copy_keys: bool,
     objects: Vec<OpenObject>,
-    keys: Vec<KeyEntry>,
+    /// The opening quote of each key of the open objects.
+    quotes: Vec<usize>,
+    /// [`dupes::fingerprint`] of each key's decoded text, kept apart so the
+    /// comparison as each key arrives scans one dense array.
+    prints: Vec<u64>,
+    /// With `copy_keys`: each key's decoded text, as a range of `arena`.
+    copies: Vec<(usize, usize)>,
     arena: String,
     order: Vec<usize>,
 }
@@ -151,7 +158,9 @@ impl Machine {
             pending: Pending::None,
             copy_keys: false,
             objects: Vec::new(),
-            keys: Vec::new(),
+            quotes: Vec::new(),
+            prints: Vec::new(),
+            copies: Vec::new(),
             arena: String::new(),
             order: Vec::new(),
         }
@@ -423,55 +432,76 @@ impl Machine {
     /// repeats a key.
     fn close_object<'s>(&mut self, src: &'s str, at: usize) -> Result<Event<'s>, Error> {
         if self.checks_keys() {
-            let Some(open) = self.objects.pop() else {
-                return Ok(self.close(at, Event::EndObject));
-            };
-            let Self {
-                keys, arena, order, ..
-            } = self;
-            let members = keys.get(open.keys..).unwrap_or(&[]);
-            let text = |i: usize| {
-                members.get(i).map_or("", |k| {
-                    let from = if k.in_text { src } else { arena.as_str() };
-                    from.get(k.start..k.start + k.len).unwrap_or("")
-                })
-            };
-            if dupes::has_duplicates(members.len(), &text, order) {
-                let repeat = dupes::first_repeat(&text, order);
-                let quote = members.get(repeat).map_or(at, |k| k.quote);
-                return Err(Error::new(ErrorKind::DuplicateKey, quote));
+            if let Some(open) = self.objects.pop() {
+                if open.suspect {
+                    self.check_object(src, open)?;
+                }
+                self.quotes.truncate(open.keys);
+                self.prints.truncate(open.keys);
+                self.copies.truncate(open.copies);
+                self.arena.truncate(open.arena);
             }
-            keys.truncate(open.keys);
-            arena.truncate(open.arena);
         }
         Ok(self.close(at, Event::EndObject))
     }
 
-    /// Keeps the key at `quote..end` of the object being read.
+    /// Compares the keys of the closing object `open` as text, refusing a
+    /// repeat.
+    #[cold]
+    fn check_object(&mut self, src: &str, open: OpenObject) -> Result<(), Error> {
+        let quotes = self.quotes.get(open.keys..).unwrap_or(&[]);
+        let repeat = if self.copy_keys {
+            let copies = self.copies.get(open.copies..).unwrap_or(&[]);
+            let arena = self.arena.as_str();
+            let text = |i: usize| {
+                copies
+                    .get(i)
+                    .and_then(|&(from, to)| arena.get(from..to))
+                    .unwrap_or("")
+            };
+            dupes::has_duplicates(quotes.len(), &text, &mut self.order)
+                .then(|| dupes::first_repeat(&text, &self.order))
+        } else {
+            // Read each key again from the text: the keys only, not the
+            // values between them.
+            let texts: Vec<Cow<'_, str>> = quotes.iter().map(|&q| key_text(src, q)).collect();
+            let text = |i: usize| texts.get(i).map_or("", |t| t);
+            dupes::has_duplicates(texts.len(), &text, &mut self.order)
+                .then(|| dupes::first_repeat(&text, &self.order))
+        };
+        match repeat.and_then(|i| quotes.get(i)) {
+            Some(&quote) => Err(Error::new(ErrorKind::DuplicateKey, quote)),
+            None => Ok(()),
+        }
+    }
+
+    /// Notes the key at `quote..end` of the object being read, and whether
+    /// it may repeat an earlier one.
     fn keep_key(&mut self, src: &str, quote: usize, end: usize, escaped: bool) {
         let body = src.get(quote + 1..end - 1).unwrap_or("");
-        let entry = if escaped || self.copy_keys {
-            let start = self.arena.len();
+        let print = if self.copy_keys {
+            let from = self.arena.len();
             if escaped {
                 self.arena.push_str(&lexer::decode(body));
             } else {
                 self.arena.push_str(body);
             }
-            KeyEntry {
-                quote,
-                start,
-                len: self.arena.len() - start,
-                in_text: false,
-            }
+            let to = self.arena.len();
+            self.copies.push((from, to));
+            dupes::fingerprint(self.arena.as_bytes().get(from..to).unwrap_or_default())
+        } else if escaped {
+            dupes::fingerprint(lexer::decode(body).as_bytes())
         } else {
-            KeyEntry {
-                quote,
-                start: quote + 1,
-                len: body.len(),
-                in_text: true,
-            }
+            dupes::fingerprint(body.as_bytes())
         };
-        self.keys.push(entry);
+        if let Some(open) = self.objects.last_mut() {
+            let earlier = self.prints.get(open.keys..).unwrap_or(&[]);
+            if earlier.len() >= COMPARE_AS_READ || earlier.contains(&print) {
+                open.suspect = true;
+            }
+        }
+        self.quotes.push(quote);
+        self.prints.push(print);
     }
 
     /// Counts one more value, refusing it if the budget is spent.
@@ -485,6 +515,7 @@ impl Machine {
     }
 
     /// Reads the value starting with byte `b` at `at`.
+    #[inline]
     fn value<'s>(&mut self, src: &'s str, b: u8, at: usize) -> Result<Event<'s>, Error> {
         match b {
             b'{' | b'[' => {
@@ -499,8 +530,10 @@ impl Machine {
                     self.state = State::ObjectFirst;
                     if self.checks_keys() {
                         self.objects.push(OpenObject {
-                            keys: self.keys.len(),
+                            keys: self.quotes.len(),
+                            copies: self.copies.len(),
                             arena: self.arena.len(),
+                            suspect: false,
                         });
                     }
                     Event::StartObject
@@ -527,6 +560,7 @@ impl Machine {
     }
 
     /// Reads (or continues) the string value whose quote is at `quote`.
+    #[inline(always)]
     fn string<'s>(
         &mut self,
         src: &'s str,
@@ -600,6 +634,7 @@ impl Machine {
     }
 
     /// Reads (or continues) the number starting at `start`.
+    #[inline]
     fn number<'s>(
         &mut self,
         src: &'s str,
@@ -622,6 +657,7 @@ impl Machine {
 
     /// Reads the literal starting at `start` (its first byte is `t`, `f`, or
     /// `n`).
+    #[inline]
     fn literal<'s>(&mut self, src: &'s str, start: usize) -> Result<Event<'s>, Error> {
         let (word, event): (&[u8], _) = match src.as_bytes().get(start) {
             Some(b't') => (b"true", Event::Bool(true)),
@@ -641,6 +677,7 @@ impl Machine {
 
     /// The contents of the string at `quote..end`: borrowed when it has no
     /// escapes (or while skipping), decoded otherwise.
+    #[inline]
     fn body<'s>(&self, src: &'s str, quote: usize, end: usize, escaped: bool) -> Cow<'s, str> {
         let body = src.get(quote + 1..end - 1).unwrap_or("");
         if escaped && !self.skipping {
@@ -648,6 +685,21 @@ impl Machine {
         } else {
             Cow::Borrowed(body)
         }
+    }
+}
+
+/// The decoded text of the (valid) key whose opening quote is at `quote`.
+fn key_text(src: &str, quote: usize) -> Cow<'_, str> {
+    match lexer::scan_string(src.as_bytes(), quote, usize::MAX) {
+        Ok(token) => {
+            let body = src.get(quote + 1..token.end - 1).unwrap_or("");
+            if token.escaped {
+                Cow::Owned(lexer::decode(body))
+            } else {
+                Cow::Borrowed(body)
+            }
+        }
+        Err(_) => Cow::Borrowed(""),
     }
 }
 

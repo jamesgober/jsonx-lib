@@ -56,9 +56,27 @@ const fn read_hits(x: u64) -> u64 {
 
 /// The index of the first byte at or after `from` in `bytes[..end]` that is
 /// [`is_read_special`], or `end` if there is none.
-#[inline]
+///
+/// Most strings are short (keys, identifiers), so the first word is tested
+/// here, inline in the caller; a longer run continues out of line.
+#[inline(always)]
 pub(crate) fn find_read_special(bytes: &[u8], from: usize, end: usize) -> usize {
     let end = end.min(bytes.len());
+    if from + 8 <= end {
+        if let Some(chunk) = bytes.get(from..).and_then(<[u8]>::first_chunk::<8>) {
+            let hits = read_hits(u64::from_le_bytes(*chunk));
+            if hits != 0 {
+                return from + (hits.trailing_zeros() / 8) as usize;
+            }
+            return find_read_special_run(bytes, from + 8, end);
+        }
+    }
+    find_read_special_run(bytes, from, end)
+}
+
+/// [`find_read_special`] past its first word.
+#[inline(never)]
+fn find_read_special_run(bytes: &[u8], from: usize, end: usize) -> usize {
     let mut i = from;
     // Sixteen bytes per step while there is room: two independent words, so
     // the CPU tests both at once and branches once.
@@ -153,7 +171,7 @@ const fn lanes_exactly(x: u64, byte: u8) -> u64 {
 /// Compact JSON has no whitespace or a single space between tokens, so the
 /// first two bytes are checked one at a time; a longer run (indentation in
 /// pretty-printed JSON) is skipped eight bytes at a time.
-#[inline]
+#[inline(always)]
 pub(crate) fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
     let mut i = from;
     for _ in 0..2 {
@@ -162,6 +180,13 @@ pub(crate) fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
             _ => return i,
         }
     }
+    skip_whitespace_run(bytes, i)
+}
+
+/// [`skip_whitespace`] past its first two bytes, out of line.
+#[inline(never)]
+fn skip_whitespace_run(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
     while let Some(chunk) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) {
         let x = u64::from_le_bytes(*chunk);
         let blank = lanes_exactly(x, b' ')
