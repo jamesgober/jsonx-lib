@@ -118,6 +118,9 @@ pub struct Reader<'a> {
     src: &'a str,
     machine: Machine,
     failed: Option<Error>,
+    /// Heap held by what the current document's reads have built (trees
+    /// and typed values), against [`Limits::max_memory`].
+    held: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -147,6 +150,7 @@ impl<'a> Reader<'a> {
             src: text,
             machine: Machine::new(limits, duplicates, true),
             failed,
+            held: 0,
         }
     }
 
@@ -288,9 +292,9 @@ impl<'a> Reader<'a> {
         if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
+        self.new_document_budget();
         let duplicates = self.machine.duplicates;
-        let max_memory = self.machine.limits.max_memory;
-        parser::build(self, duplicates, max_memory)
+        parser::build(self, duplicates)
             .inspect_err(|&e| self.failed = Some(e))
             .map(Some)
     }
@@ -544,6 +548,47 @@ impl<'a> Reader<'a> {
             Some(more) => Ok(more),
             None => self.machine.at_value(self.src),
         }
+    }
+
+    /// Starts the memory count afresh for a read of a whole document: one
+    /// at the top level (`depth() == 0`). A read inside a document keeps
+    /// adding to its document's count.
+    #[inline]
+    pub(crate) fn new_document_budget(&mut self) {
+        if self.machine.depth() == 0 {
+            self.held = 0;
+        }
+    }
+
+    /// What the current document's reads hold, in bytes.
+    #[inline]
+    pub(crate) const fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Records `held` bytes held in all by the current document's reads.
+    #[inline]
+    pub(crate) fn set_held(&mut self, held: usize) {
+        self.held = held;
+    }
+
+    /// The memory budget, [`Limits::max_memory`].
+    #[inline]
+    pub(crate) const fn max_memory(&self) -> usize {
+        self.machine.limits.max_memory
+    }
+
+    /// Charges `bytes` more to the current document, refusing them, as
+    /// [`ErrorKind::MemoryLimitExceeded`] at `at`, past
+    /// [`Limits::max_memory`].
+    #[inline]
+    pub(crate) fn charge(&mut self, bytes: usize, at: usize) -> Result<(), Error> {
+        let held = self.held.saturating_add(bytes);
+        if held > self.max_memory() {
+            return Err(Error::new(ErrorKind::MemoryLimitExceeded, at));
+        }
+        self.held = held;
+        Ok(())
     }
 
     /// The reader's duplicate-key policy.

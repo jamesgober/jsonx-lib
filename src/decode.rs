@@ -645,7 +645,17 @@ impl<'a> Reader<'a> {
     /// # Ok::<(), jsonx_lib::DecodeError>(())
     /// ```
     pub fn decode<T: FromJson<'a>>(&mut self) -> Result<T, DecodeError> {
+        self.new_document_budget();
         decode_value(self)
+    }
+
+    /// Charges `bytes` of heap that a typed read is about to hold to the
+    /// current document's [`Limits::max_memory`](crate::Limits::max_memory)
+    /// count.
+    #[inline]
+    fn hold(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        let at = self.offset();
+        self.charge(bytes, at).map_err(DecodeError::from)
     }
 
     /// Starts reading an object whose members are read one by one through
@@ -1641,7 +1651,11 @@ fn string<'de>(
 impl<'de> FromJson<'de> for Cow<'de, str> {
     #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
-        string(reader, "a string").map(|(s, _)| s)
+        let (s, _) = string(reader, "a string")?;
+        if let Cow::Owned(decoded) = &s {
+            reader.hold(decoded.capacity())?;
+        }
+        Ok(s)
     }
 }
 
@@ -1658,7 +1672,12 @@ impl<'de> FromJson<'de> for &'de str {
 impl<'de> FromJson<'de> for String {
     #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
-        string(reader, "a string").map(|(s, _)| s.into_owned())
+        let (s, _) = string(reader, "a string")?;
+        reader.hold(match &s {
+            Cow::Owned(decoded) => decoded.capacity(),
+            Cow::Borrowed(text) => text.len(),
+        })?;
+        Ok(s.into_owned())
     }
 }
 
@@ -1707,7 +1726,9 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for Option<T> {
 
 impl<'de, T: FromJson<'de>> FromJson<'de> for Box<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
-        T::from_json(reader).map(Box::new)
+        let value = T::from_json(reader)?;
+        reader.hold(size_of::<T>())?;
+        Ok(Box::new(value))
     }
 
     fn absent() -> Option<Self> {
@@ -1717,7 +1738,9 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for Box<T> {
 
 impl<'de, T: FromJson<'de>> FromJson<'de> for Rc<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
-        T::from_json(reader).map(Rc::new)
+        let value = T::from_json(reader)?;
+        reader.hold(size_of::<T>() + 2 * size_of::<usize>())?;
+        Ok(Rc::new(value))
     }
 
     fn absent() -> Option<Self> {
@@ -1728,7 +1751,9 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for Rc<T> {
 #[cfg(target_has_atomic = "ptr")]
 impl<'de, T: FromJson<'de>> FromJson<'de> for Arc<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
-        T::from_json(reader).map(Arc::new)
+        let value = T::from_json(reader)?;
+        reader.hold(size_of::<T>() + 2 * size_of::<usize>())?;
+        Ok(Arc::new(value))
     }
 
     fn absent() -> Option<Self> {
@@ -1737,9 +1762,26 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for Arc<T> {
 }
 
 /// Reads every item of an array into `push`.
+/// What a collection holds per item, for the memory budget.
+#[derive(Clone, Copy)]
+enum Cost {
+    /// A vector of items of this size: its buffer, counted as it doubles.
+    Buffer(usize),
+    /// A tree or hash set: about this many bytes per item.
+    PerItem(usize),
+}
+
+/// The bytes a hash or tree collection holds per entry of `entry` bytes: an
+/// estimate (a B-tree node's spare slots and links, a hash table's spare
+/// capacity and control bytes), at about twice the entries themselves.
+const fn per_entry(entry: usize) -> usize {
+    2 * entry + size_of::<usize>()
+}
+
 fn items<'de, T: FromJson<'de>>(
     reader: &mut Reader<'de>,
     expected: &'static str,
+    cost: Cost,
     mut push: impl FnMut(T),
 ) -> Result<(), DecodeError> {
     let start = reader.open(Kind::Array, expected)?;
@@ -1749,7 +1791,21 @@ fn items<'de, T: FromJson<'de>>(
         index: 0,
         done: false,
     };
+    // The buffer a vector of `count` items has grown to (they double, from
+    // four), so the charge is made before each growth, at its new size.
+    let mut capacity = 0usize;
     while let Some(item) = array.next_item()? {
+        let more = match cost {
+            Cost::Buffer(size) if array.index > capacity => {
+                let grown = capacity.saturating_mul(2).max(4);
+                let bytes = (grown - capacity).saturating_mul(size);
+                capacity = grown;
+                bytes
+            }
+            Cost::Buffer(_) => 0,
+            Cost::PerItem(bytes) => bytes,
+        };
+        array.reader.hold(more)?;
         push(item);
     }
     Ok(())
@@ -1758,7 +1814,9 @@ fn items<'de, T: FromJson<'de>>(
 impl<'de, T: FromJson<'de>> FromJson<'de> for Vec<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let mut out = Vec::new();
-        items(reader, "an array", |item| out.push(item))?;
+        items(reader, "an array", Cost::Buffer(size_of::<T>()), |item| {
+            out.push(item)
+        })?;
         Ok(out)
     }
 }
@@ -1772,7 +1830,9 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for Box<[T]> {
 impl<'de, T: FromJson<'de>> FromJson<'de> for VecDeque<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let mut out = VecDeque::new();
-        items(reader, "an array", |item| out.push_back(item))?;
+        items(reader, "an array", Cost::Buffer(size_of::<T>()), |item| {
+            out.push_back(item);
+        })?;
         Ok(out)
     }
 }
@@ -1780,9 +1840,14 @@ impl<'de, T: FromJson<'de>> FromJson<'de> for VecDeque<T> {
 impl<'de, T: FromJson<'de> + Ord> FromJson<'de> for BTreeSet<T> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let mut out = BTreeSet::new();
-        items(reader, "an array", |item| {
-            let _new = out.insert(item);
-        })?;
+        items(
+            reader,
+            "an array",
+            Cost::PerItem(per_entry(size_of::<T>())),
+            |item| {
+                let _new = out.insert(item);
+            },
+        )?;
         Ok(out)
     }
 }
@@ -1795,9 +1860,14 @@ where
 {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let mut out = Self::default();
-        items(reader, "an array", |item| {
-            let _new = out.insert(item);
-        })?;
+        items(
+            reader,
+            "an array",
+            Cost::PerItem(per_entry(size_of::<T>())),
+            |item| {
+                let _new = out.insert(item);
+            },
+        )?;
         Ok(out)
     }
 }
@@ -1922,6 +1992,7 @@ fn members<'de, K: FromJsonKey<'de>, V: FromJson<'de>>(
             }
         }
         let value = object.value()?;
+        object.reader.hold(per_entry(size_of::<(K, V)>()))?;
         map.put(key, value);
     }
     Ok(())

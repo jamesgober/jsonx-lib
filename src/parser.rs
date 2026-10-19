@@ -405,7 +405,6 @@ struct Scratch {
 pub(crate) fn build<'a>(
     reader: &mut Reader<'a>,
     policy: DuplicateKeys,
-    max_memory: usize,
 ) -> Result<Value<'a>, Error> {
     let mut values: Vec<Value<'a>> = Vec::new();
     let mut keys: Vec<Cow<'a, str>> = Vec::new();
@@ -416,9 +415,11 @@ pub(crate) fn build<'a>(
         start: 0,
     });
     let mut scratch = Scratch::default();
+    // The document's count so far: a tree built inside a typed read adds
+    // to what that read already holds.
     let mut budget = Budget {
-        max: max_memory,
-        held: 0,
+        max: reader.max_memory(),
+        held: reader.held(),
     };
     loop {
         let Some(event) = reader.next_event()? else {
@@ -452,6 +453,7 @@ pub(crate) fn build<'a>(
                     // which becomes the array in place, already counted.
                     let mut items = core::mem::take(&mut values);
                     items.shrink_to_fit();
+                    reader.set_held(budget.held + items.capacity() * size_of::<Value<'a>>());
                     return Ok(Value::Array(Array::from(items)));
                 }
                 let bytes = (values.len() - frame.values) * size_of::<Value<'a>>();
@@ -486,6 +488,7 @@ pub(crate) fn build<'a>(
             Event::Null => Value::Null,
         };
         if frames.len() == 0 {
+            reader.set_held(budget.held);
             return Ok(value);
         }
         let start = match &value {

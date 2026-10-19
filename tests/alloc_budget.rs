@@ -186,4 +186,85 @@ fn test_budgets_hostile_input_refused_before_allocating() {
     let (r, peak) = peak_during(|| tight.parse(&borrowed).map(|v| v.as_str().map(str::len)));
     assert_eq!(r.ok().flatten(), Some(1000));
     assert_eq!(peak, 0, "borrowed string");
+
+    // Typed reads share the same budget (verification JX2-SEC-02: under 0.5's
+    // first build, `BTreeMap<&str, Value>` held 148 MiB from 9.9 MiB).
+    let mut map = String::from("{");
+    for i in 0..200_000 {
+        map.push_str(&format!("\"k{i}\":[],"));
+    }
+    map.push_str("\"end\":[]}");
+    let strings = format!("[{}\"\"]", "\"ab\",".repeat(200_000));
+    let values = format!("[{}[]]", "[],".repeat(200_000));
+    let one_mib = 1 << 20;
+    let tight = Parser::new().limits(Limits::new().with_max_memory(one_mib));
+    type Decode<'a> = Box<dyn Fn() -> Result<usize, jsonx_lib::DecodeError> + 'a>;
+    let typed: [(&str, Decode<'_>); 5] = [
+        (
+            "BTreeMap<&str, Value>",
+            Box::new(|| {
+                tight
+                    .decode::<std::collections::BTreeMap<&str, jsonx_lib::Value>>(&map)
+                    .map(|m| m.len())
+            }),
+        ),
+        (
+            "BTreeMap<String, Vec<u8>>",
+            Box::new(|| {
+                tight
+                    .decode::<std::collections::BTreeMap<String, Vec<u8>>>(&map)
+                    .map(|m| m.len())
+            }),
+        ),
+        (
+            "Vec<String>",
+            Box::new(|| tight.decode::<Vec<String>>(&strings).map(|v| v.len())),
+        ),
+        (
+            "Vec<Value>",
+            Box::new(|| {
+                tight
+                    .decode::<Vec<jsonx_lib::Value>>(&values)
+                    .map(|v| v.len())
+            }),
+        ),
+        (
+            "Vec<Box<Vec<u8>>>",
+            Box::new(|| tight.decode::<Vec<Box<Vec<u8>>>>(&values).map(|v| v.len())),
+        ),
+    ];
+    for (name, decode) in typed {
+        let (r, peak) = peak_during(decode);
+        let err = r.err().map(|e| e.kind().clone());
+        assert_eq!(
+            err,
+            Some(jsonx_lib::DecodeErrorKind::Syntax(
+                ErrorKind::MemoryLimitExceeded
+            )),
+            "{name}"
+        );
+        // The estimates for tree and hash collections are rough: within a
+        // small multiple of the budget, not hundreds of times the input.
+        assert!(peak <= 3 * one_mib, "{name}: {peak} bytes");
+    }
+    // Within the budget, the same reads succeed.
+    let loose = Parser::new();
+    assert_eq!(
+        loose.decode::<Vec<String>>(&strings).map(|v| v.len()).ok(),
+        Some(200_001)
+    );
+    // A stream reader's typed reads use its budget too.
+    let mut stream = tight.stream_reader();
+    assert!(stream.feed(strings.as_bytes()).is_ok());
+    stream.end_input();
+    let err = stream
+        .decode::<Vec<String>>()
+        .err()
+        .map(|e| e.kind().clone());
+    assert_eq!(
+        err,
+        Some(jsonx_lib::DecodeErrorKind::Syntax(
+            ErrorKind::MemoryLimitExceeded
+        ))
+    );
 }

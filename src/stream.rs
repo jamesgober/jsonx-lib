@@ -555,8 +555,10 @@ impl StreamReader {
             .unwrap_or("");
         // The budgets, and duplicates under `DuplicateKeys::Error`, were
         // checked while the value was skipped. The depth budget stays, to
-        // bound a recursive `T`.
-        let limits = Limits::unlimited().with_max_depth(self.machine.limits.max_depth);
+        // bound a recursive `T`, and the memory budget, for what `T` holds.
+        let limits = Limits::unlimited()
+            .with_max_depth(self.machine.limits.max_depth)
+            .with_max_memory(self.machine.limits.max_memory);
         let parser = Parser::new()
             .limits(limits)
             .duplicate_keys(self.machine.duplicates)

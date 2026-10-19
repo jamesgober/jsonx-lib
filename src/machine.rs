@@ -112,6 +112,11 @@ const INLINE_OBJECTS: usize = 8;
 /// Keys of open objects kept inline (more spill to the heap).
 const INLINE_KEYS: usize = 16;
 
+/// The heap the duplicate check holds per key of the open objects, once
+/// they spill: the key's mark, and what checking its object at `}` takes
+/// (its offset, its text, and its place in the sort).
+const KEY_STATE_BYTES: usize = size_of::<KeyMark>() + 5 * size_of::<usize>();
+
 /// The reader's position in the grammar, with its budgets. See the module
 /// documentation.
 ///
@@ -596,7 +601,16 @@ impl Machine {
     /// Notes the key at `quote..end` of the object being read, and whether
     /// it may repeat an earlier one.
     #[inline]
-    fn keep_key(&mut self, src: &str, quote: usize, end: usize, escaped: bool) {
+    fn keep_key(
+        &mut self,
+        src: &str,
+        quote: usize,
+        end: usize,
+        escaped: bool,
+    ) -> Result<(), Error> {
+        if self.keys.len() >= INLINE_KEYS {
+            self.key_state_fits(quote)?;
+        }
         let print = if self.copy_keys || escaped {
             self.decoded_print(src, quote, end, escaped)
         } else {
@@ -618,6 +632,21 @@ impl Machine {
             print,
             quote: quote + self.dropped,
         });
+        Ok(())
+    }
+
+    /// Refuses the key at `quote` if the duplicate check's state for the
+    /// open objects' keys (and, with `copy_keys`, their copies) would pass
+    /// [`Limits::max_memory`].
+    #[cold]
+    fn key_state_fits(&self, quote: usize) -> Result<(), Error> {
+        let held = (self.keys.len() + 1)
+            .saturating_mul(KEY_STATE_BYTES)
+            .saturating_add(self.arena.len());
+        if held > self.limits.max_memory {
+            return Err(Error::new(ErrorKind::MemoryLimitExceeded, quote));
+        }
+        Ok(())
     }
 
     /// The fingerprint of the key at `quote..end` when its decoded text is
@@ -766,7 +795,7 @@ impl Machine {
                 self.last = quote;
                 self.state = State::Value;
                 if self.checks_keys() {
-                    self.keep_key(src, quote, end, escaped);
+                    self.keep_key(src, quote, end, escaped)?;
                 }
                 Ok(Event::Key(self.body(src, quote, end, escaped)))
             }
@@ -993,6 +1022,33 @@ mod tests {
         }
         assert!(checked(&alloc::format!("{{{wide}\"end\": 0}}")).is_ok());
         assert!(checked(&alloc::format!("{{{wide}\"k3\": 0}}")).is_err());
+    }
+
+    #[test]
+    fn test_duplicate_check_state_is_bounded_by_the_memory_budget() {
+        let mut wide = alloc::string::String::from("{");
+        for i in 0..100 {
+            wide.push_str(&alloc::format!(r#""k{i}": 0, "#));
+        }
+        wide.push_str(r#""end": 0}"#);
+        let run = |max_memory: usize, duplicates: DuplicateKeys| {
+            let limits = Limits::new().with_max_memory(max_memory);
+            let mut m = Machine::new(limits, duplicates, true);
+            loop {
+                match m.step(&wide) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(e.kind()),
+                }
+            }
+        };
+        assert_eq!(
+            run(1000, DuplicateKeys::Error),
+            Err(ErrorKind::MemoryLimitExceeded)
+        );
+        assert_eq!(run(KEY_STATE_BYTES * 101, DuplicateKeys::Error), Ok(()));
+        // No state is kept without the check.
+        assert_eq!(run(1000, DuplicateKeys::KeepAll), Ok(()));
     }
 
     #[test]
