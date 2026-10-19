@@ -577,19 +577,8 @@ impl Machine {
     /// it may repeat an earlier one.
     #[inline]
     fn keep_key(&mut self, src: &str, quote: usize, end: usize, escaped: bool) {
-        let body = src.get(quote + 1..end - 1).unwrap_or("");
-        let print = if self.copy_keys {
-            let from = self.arena.len();
-            if escaped {
-                self.arena.push_str(&lexer::decode(body));
-            } else {
-                self.arena.push_str(body);
-            }
-            let to = self.arena.len();
-            self.copies.push((from, to));
-            dupes::fingerprint(self.arena.as_bytes().get(from..to).unwrap_or_default())
-        } else if escaped {
-            dupes::fingerprint(lexer::decode(body).as_bytes())
+        let print = if self.copy_keys || escaped {
+            self.decoded_print(src, quote, end, escaped)
         } else {
             dupes::fingerprint_at(src.as_bytes(), quote + 1, end - 1)
         };
@@ -606,6 +595,28 @@ impl Machine {
             }
         }
         self.keys.push(KeyMark { print, quote });
+    }
+
+    /// The fingerprint of the key at `quote..end` when its decoded text is
+    /// needed: it has escapes, or (with `copy_keys`) is copied to the arena.
+    /// Out of line, to keep [`keep_key`](Self::keep_key) small.
+    #[cold]
+    #[inline(never)]
+    fn decoded_print(&mut self, src: &str, quote: usize, end: usize, escaped: bool) -> u64 {
+        let body = src.get(quote + 1..end - 1).unwrap_or("");
+        if self.copy_keys {
+            let from = self.arena.len();
+            if escaped {
+                self.arena.push_str(&lexer::decode(body));
+            } else {
+                self.arena.push_str(body);
+            }
+            let to = self.arena.len();
+            self.copies.push((from, to));
+            dupes::fingerprint(self.arena.as_bytes().get(from..to).unwrap_or_default())
+        } else {
+            dupes::fingerprint(lexer::decode(body).as_bytes())
+        }
     }
 
     /// Counts one more value, refusing it if the budget is spent.
