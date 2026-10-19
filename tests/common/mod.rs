@@ -13,6 +13,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+// The fuzz targets include this file without proptest.
+#[cfg(not(fuzzing))]
 pub mod strategies;
 
 /// A parsed value, with numbers as their exact text.

@@ -1,0 +1,62 @@
+# Fuzz targets for every entry point that reads untrusted input (cargo-fuzz
+# layout). libFuzzer does not build on Windows MSVC: run them on Linux (WSL
+# works), on nightly, with the GNU target (the prebuilt cargo-fuzz defaults
+# to musl, which AddressSanitizer cannot link):
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu parse -- -max_total_time=60
+#
+# Not published, and not part of the crate's package. The checks live in
+# `../tests/harness/mod.rs`, shared with `../tests/fuzz_harness.rs`, which
+# runs them on arbitrary bytes in plain `cargo test` on every platform.
+[package]
+name    = "jsonx-lib-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+jsonx-lib     = { path = ".." }
+libfuzzer-sys = "0.4"
+
+# Its own workspace: kept out of the crate's builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name  = "parse"
+path  = "fuzz_targets/parse.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "reader"
+path  = "fuzz_targets/reader.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "stream"
+path  = "fuzz_targets/stream.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "decode"
+path  = "fuzz_targets/decode.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "write"
+path  = "fuzz_targets/write.rs"
+test  = false
+doc   = false
+bench = false
