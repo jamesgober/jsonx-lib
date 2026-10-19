@@ -184,6 +184,7 @@ impl DecodeError {
     /// let err = DecodeError::new(DecodeErrorKind::InvalidValue("a port"), 12);
     /// assert_eq!(err.to_string(), "invalid value: expected a port at byte 12");
     /// ```
+    #[cold]
     pub fn new(kind: DecodeErrorKind, offset: usize) -> Self {
         Self(Box::new(Inner {
             kind,
@@ -202,6 +203,7 @@ impl DecodeError {
     /// let err = DecodeError::wrong_type("a position", Kind::Array, 4);
     /// assert_eq!(err.to_string(), "expected a position, found array at byte 4");
     /// ```
+    #[cold]
     pub fn wrong_type(expected: &'static str, found: Kind, offset: usize) -> Self {
         Self::new(DecodeErrorKind::WrongType { expected, found }, offset)
     }
@@ -214,6 +216,7 @@ impl DecodeError {
     /// let err = jsonx_lib::DecodeError::invalid_value("a URI", 0);
     /// assert_eq!(err.to_string(), "invalid value: expected a URI at byte 0");
     /// ```
+    #[cold]
     pub fn invalid_value(expected: &'static str, offset: usize) -> Self {
         Self::new(DecodeErrorKind::InvalidValue(expected), offset)
     }
@@ -238,6 +241,7 @@ impl DecodeError {
     /// let err = jsonx_lib::DecodeError::missing_field("uri", 0);
     /// assert_eq!(err.to_string(), "missing field `uri` at byte 0");
     /// ```
+    #[cold]
     pub fn missing_field(name: &'static str, offset: usize) -> Self {
         Self::new(DecodeErrorKind::MissingField(name), offset)
     }
@@ -251,6 +255,7 @@ impl DecodeError {
     /// let err = jsonx_lib::DecodeError::invalid_value("a URI", 7).at_key("uri").at_key("textDocument");
     /// assert_eq!(err.pointer(), "/textDocument/uri");
     /// ```
+    #[cold]
     pub fn at_key(mut self, key: impl Into<String>) -> Self {
         self.0.path.insert(0, PathSegment::Key(key.into()));
         self
@@ -264,6 +269,7 @@ impl DecodeError {
     /// let err = jsonx_lib::DecodeError::invalid_value("a URI", 7).at_index(2);
     /// assert_eq!(err.pointer(), "/2");
     /// ```
+    #[cold]
     pub fn at_index(mut self, index: usize) -> Self {
         self.0.path.insert(0, PathSegment::Index(index));
         self
@@ -378,6 +384,7 @@ impl DecodeError {
 }
 
 impl From<Error> for DecodeError {
+    #[cold]
     fn from(e: Error) -> Self {
         Self::new(DecodeErrorKind::Syntax(e.kind()), e.offset())
     }
@@ -763,21 +770,35 @@ impl<'a> Reader<'a> {
     /// error, such as a trailing comma).
     #[inline]
     fn scalar(&mut self, expected: &'static str) -> Result<(Event<'a>, usize), DecodeError> {
-        match self.next_event()? {
-            Some(event @ (Event::StartArray | Event::StartObject)) => Err(DecodeError::wrong_type(
-                expected,
-                event_kind(&event),
-                self.event_offset(),
-            )),
-            Some(Event::EndArray | Event::EndObject | Event::Key(_)) => Err(DecodeError::new(
+        match self.next_event() {
+            Ok(Some(
+                event @ (Event::String(_) | Event::Number(_) | Event::Bool(_) | Event::Null),
+            )) => Ok((event, self.event_offset())),
+            other => Err(self.not_a_scalar(other, expected)),
+        }
+    }
+
+    /// The error of a [`scalar`](Self::scalar) read that found no scalar.
+    #[cold]
+    #[inline(never)]
+    fn not_a_scalar(
+        &self,
+        read: Result<Option<Event<'a>>, Error>,
+        expected: &'static str,
+    ) -> DecodeError {
+        match read {
+            Err(e) => e.into(),
+            Ok(Some(event @ (Event::StartArray | Event::StartObject))) => {
+                DecodeError::wrong_type(expected, event_kind(&event), self.event_offset())
+            }
+            Ok(Some(_)) => DecodeError::new(
                 DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
                 self.event_offset(),
-            )),
-            Some(event) => Ok((event, self.event_offset())),
-            None => Err(DecodeError::new(
+            ),
+            Ok(None) => DecodeError::new(
                 DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
                 self.offset(),
-            )),
+            ),
         }
     }
 }
@@ -1527,6 +1548,7 @@ impl<T: ToJson> ToJson for Nullable<T> {
 // ---- Implementations ---------------------------------------------------------
 
 impl<'de> FromJson<'de> for bool {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         match reader.scalar("a boolean")? {
             (Event::Bool(b), _) => Ok(b),
@@ -1536,6 +1558,7 @@ impl<'de> FromJson<'de> for bool {
 }
 
 /// Reads a number value for the target type `name`.
+#[inline]
 fn number<'de>(
     reader: &mut Reader<'de>,
     name: &'static str,
@@ -1546,20 +1569,35 @@ fn number<'de>(
     }
 }
 
+/// An integer read whose text is not an integer in range: under
+/// [`Numbers::WholeValues`], the value of any spelling of a whole number;
+/// otherwise (or out of range) [`DecodeErrorKind::OutOfRange`].
+#[cold]
+#[inline(never)]
+fn whole_value<T: TryFrom<i128>>(
+    n: &Number<'_>,
+    lenient: bool,
+    at: usize,
+    expected: &'static str,
+) -> Result<T, DecodeError> {
+    lenient
+        .then(|| n.whole_value())
+        .flatten()
+        .and_then(|w| T::try_from(w).ok())
+        .ok_or_else(|| DecodeError::new(DecodeErrorKind::OutOfRange { expected }, at))
+}
+
 macro_rules! from_json_integer {
     ($($t:ty => $via:ident),* $(,)?) => {$(
         impl<'de> FromJson<'de> for $t {
+            #[inline]
             fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
                 let lenient = reader.number_policy() == Numbers::WholeValues;
                 let (n, at) = number(reader, stringify!($t))?;
-                n.$via()
-                    .and_then(|wide| <$t>::try_from(wide).ok())
-                    .or_else(|| {
-                        lenient.then(|| n.whole_value()).flatten().and_then(|w| <$t>::try_from(w).ok())
-                    })
-                    .ok_or_else(|| {
-                        DecodeError::new(DecodeErrorKind::OutOfRange { expected: stringify!($t) }, at)
-                    })
+                match n.$via().and_then(|wide| <$t>::try_from(wide).ok()) {
+                    Some(value) => Ok(value),
+                    None => whole_value(&n, lenient, at, stringify!($t)),
+                }
             }
         }
     )*};
@@ -1571,6 +1609,7 @@ from_json_integer!(
 );
 
 impl<'de> FromJson<'de> for f64 {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let (n, at) = number(reader, "f64")?;
         n.as_f64()
@@ -1579,6 +1618,7 @@ impl<'de> FromJson<'de> for f64 {
 }
 
 impl<'de> FromJson<'de> for f32 {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let (n, at) = number(reader, "f32")?;
         n.as_f32()
@@ -1587,6 +1627,7 @@ impl<'de> FromJson<'de> for f32 {
 }
 
 /// Reads a string value for the target type `name`.
+#[inline]
 fn string<'de>(
     reader: &mut Reader<'de>,
     name: &'static str,
@@ -1598,12 +1639,14 @@ fn string<'de>(
 }
 
 impl<'de> FromJson<'de> for Cow<'de, str> {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         string(reader, "a string").map(|(s, _)| s)
     }
 }
 
 impl<'de> FromJson<'de> for &'de str {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         match string(reader, "a string")? {
             (Cow::Borrowed(s), _) => Ok(s),
@@ -1613,6 +1656,7 @@ impl<'de> FromJson<'de> for &'de str {
 }
 
 impl<'de> FromJson<'de> for String {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         string(reader, "a string").map(|(s, _)| s.into_owned())
     }
@@ -1645,6 +1689,7 @@ impl<'de> FromJson<'de> for () {
 }
 
 impl<'de, T: FromJson<'de>> FromJson<'de> for Option<T> {
+    #[inline]
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         if reader.peek_kind()? == Some(Kind::Null) {
             let _null = reader.next_event()?;
