@@ -169,8 +169,10 @@ assert_eq!(err.line_col(text), (1, 13));
 
 [`Limits`](#limits) bounds what a document may cost: nesting depth, input
 bytes, bytes of any one string or key, bytes of any one number, the total
-count of values, and the memory one read holds for what it builds (a tree, or
-typed values: one count per document). Each is
+count of values, and the memory one read call holds for what it builds (a
+tree, or a typed value; each `parse`, `read_value`, or `decode` call has its
+own count, shared by the reads nested inside it, so reading a large array
+item by item is bounded per item, not in total). Each is
 checked before the memory it guards is allocated: an 8 MiB string over a
 1 KiB budget is refused with under 1 KiB allocated (a counting-allocator
 test checks it), and a string within budget is decoded into one buffer sized
@@ -413,7 +415,7 @@ pub struct Limits {
 | `max_string_bytes` | 16 MiB | source bytes between a string's quotes, keys included (an escape counts at its written length) | `StringTooLong` at the opening quote |
 | `max_number_bytes` | 1 KiB | bytes of a number's text | `NumberTooLong` at the number's first byte |
 | `max_elements` | 1 Mi | values: every scalar, array, and object counts one; keys do not. Per document in a sequence | `TooManyElements` at the value that went over |
-| `max_memory` | 64 MiB | heap one read of a document holds: a parse's tree and working stacks, or a typed decode's values (see [Budgets](#budgets)) | `MemoryLimitExceeded` at the value whose storage went over |
+| `max_memory` | 64 MiB | heap one read call holds: a parse's or `read_value`'s tree and working stacks, or a typed decode's value (see [Budgets](#budgets)) | `MemoryLimitExceeded` at the value whose storage went over |
 
 The depth default matches `serde_json`'s recursion limit. `max_memory`
 counts buffers at their capacity, checked before a stack grows (the moment

@@ -645,13 +645,15 @@ impl<'a> Reader<'a> {
     /// # Ok::<(), jsonx_lib::DecodeError>(())
     /// ```
     pub fn decode<T: FromJson<'a>>(&mut self) -> Result<T, DecodeError> {
-        self.new_document_budget();
-        decode_value(self)
+        self.begin_read();
+        let value = decode_value(self);
+        self.end_read();
+        value
     }
 
     /// Charges `bytes` of heap that a typed read is about to hold to the
-    /// current document's [`Limits::max_memory`](crate::Limits::max_memory)
-    /// count.
+    /// current top-level read's
+    /// [`Limits::max_memory`](crate::Limits::max_memory) count.
     #[inline]
     fn hold(&mut self, bytes: usize) -> Result<(), DecodeError> {
         let at = self.offset();
@@ -1398,7 +1400,7 @@ impl Parser {
     /// ```
     pub fn decode<'de, T: FromJson<'de>>(&self, text: &'de str) -> Result<T, DecodeError> {
         let mut reader = self.reader(text);
-        let value = decode_value(&mut reader)?;
+        let value = reader.decode()?;
         reader.read_to_end()?;
         Ok(value)
     }
@@ -1418,7 +1420,7 @@ impl Parser {
     /// ```
     pub fn decode_bytes<'de, T: FromJson<'de>>(&self, bytes: &'de [u8]) -> Result<T, DecodeError> {
         let mut reader = self.reader_bytes(bytes)?;
-        let value = decode_value(&mut reader)?;
+        let value = reader.decode()?;
         reader.read_to_end()?;
         Ok(value)
     }

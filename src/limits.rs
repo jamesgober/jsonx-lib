@@ -18,7 +18,7 @@
 /// | [`max_string_bytes`](Self::max_string_bytes) | 16 MiB | source bytes between a string's quotes, keys included |
 /// | [`max_number_bytes`](Self::max_number_bytes) | 1 KiB | bytes of a number's text |
 /// | [`max_elements`](Self::max_elements) | 1 Mi | values in the document: every scalar, array, and object counts one |
-/// | [`max_memory`](Self::max_memory) | 64 MiB | heap a read of one document holds for what it builds: a tree, or typed values (see below) |
+/// | [`max_memory`](Self::max_memory) | 64 MiB | heap one read call holds for what it builds: a tree, or a typed value (see below) |
 ///
 /// The depth default matches `serde_json`'s recursion limit, so code moving
 /// from it sees the same behaviour. A string's budget is measured in source
@@ -44,8 +44,14 @@
 /// built ([`Parser::parse`](crate::Parser::parse), [`Reader::read_value`](crate::Reader::read_value),
 /// [`StreamReader::read_value`](crate::StreamReader::read_value)), and to
 /// typed reads ([`FromJson`](crate::FromJson) through `decode`, `from_str`,
-/// and the stream reader's `decode`): one count per document, shared by
-/// every tree and value the read builds. The crate's own impls charge what
+/// and the stream reader's `decode`). The count is per call: each
+/// top-level `parse`, `read_value`, or `decode` call starts it afresh, and
+/// every read nested inside that call (a `Value` field of a typed decode, a
+/// `decode` made by a `FromJson` impl) shares it. So the budget bounds what
+/// one call builds, which is what the caller then holds: reading a large
+/// array item by item with [`Reader::read_value`](crate::Reader::read_value)
+/// or [`Reader::decode`](crate::Reader::decode), dropping each item, is
+/// never refused for the total, however large, as in 0.2. The crate's own impls charge what
 /// they hold: owned strings at their capacity, vectors at their buffer's
 /// size as it doubles, boxes at their contents' size, and maps and sets at
 /// an estimate of about twice their entries' size (a B-tree's or hash
@@ -57,7 +63,7 @@
 /// keeps about 56 bytes per key of the objects still open (and a stream
 /// reader a copy of each key), and a key past `max_memory` of that is
 /// refused. Reading events with no check keeps only a bit per open
-/// container. So one read of a document holds at most about `max_memory`
+/// container. So one read call holds at most about `max_memory`
 /// for what it builds, plus as much again for the duplicate check's state
 /// in the worst case.
 ///
@@ -96,8 +102,8 @@ pub struct Limits {
     /// The most values a document may hold, counting every scalar, array, and
     /// object (keys are not counted separately).
     pub max_elements: usize,
-    /// The most heap, in bytes, a read of one document may hold for the tree
-    /// or the typed values it builds; see "What a tree costs" above.
+    /// The most heap, in bytes, one read call may hold for the tree or the
+    /// typed value it builds; see "What a tree costs" above.
     pub max_memory: usize,
 }
 

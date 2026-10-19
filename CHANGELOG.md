@@ -39,8 +39,11 @@ budget, `json!` for large literals, fuzzing.
   on a raw event loop seeing every member must ask for it:
   `Parser::new().duplicate_keys(DuplicateKeys::KeepAll).reader(text)`.
 - **Smaller default budgets.** `Limits::new()` allows 1 Mi values (was 4 Mi)
-  and adds `max_memory` (64 MiB) on what a read holds for what it builds
-  (a tree, or typed values). A
+  and adds `max_memory` (64 MiB) on what one read call holds for what it
+  builds (a tree, or a typed value). The count is per call (`parse`, each
+  `read_value`, each `decode`), so reading a large array item by item is
+  bounded per item, as 0.2 read it; only a single value holding more than
+  64 MiB is newly refused. A
   document that parsed under the 0.2 defaults but holds more than 1 Mi values
   or 64 MiB of tree now needs `with_max_elements` / `with_max_memory`.
 - **New `ErrorKind` variants** `MemoryLimitExceeded` and `InputAfterEnd`
@@ -161,7 +164,7 @@ budget, `json!` for large literals, fuzzing.
   smuggled second `method` (audit JX-SEC-02).
 - The default budgets allowed a parse to hold 32 times its input with no
   ceiling: 256 MiB of heap from 8 MiB of `[0,0,...]` (audit JX-SEC-01). The
-  memory budget now caps what one read of a document holds, trees and typed
+  memory budget now caps what one read call holds, trees and typed
   values alike, at `max_memory` (64 MiB by default), whatever the input's
   size; the in-place outermost array and the smaller element budget lower
   the cost further. The cap is absolute, not a ratio: a small input can

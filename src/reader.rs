@@ -122,9 +122,14 @@ pub struct Reader<'a> {
     src: &'a str,
     machine: Machine,
     failed: Option<Error>,
-    /// Heap held by what the current document's reads have built (trees
-    /// and typed values), against [`Limits::max_memory`].
+    /// Heap held by what the current top-level read has built (a tree, or
+    /// a typed value and everything inside it), against
+    /// [`Limits::max_memory`].
     held: usize,
+    /// How many reads ([`read_value`](Self::read_value),
+    /// [`decode`](Self::decode)) are running, nested: the outermost one
+    /// starts `held` afresh, the ones inside it share its count.
+    reading: u32,
 }
 
 impl<'a> Reader<'a> {
@@ -155,6 +160,7 @@ impl<'a> Reader<'a> {
             machine: Machine::new(limits, duplicates, true),
             failed,
             held: 0,
+            reading: 0,
         }
     }
 
@@ -270,6 +276,10 @@ impl<'a> Reader<'a> {
     /// Positioning is as for [`read_raw`](Self::read_raw): `Ok(None)`, with
     /// nothing consumed, when no value comes next.
     ///
+    /// Each call has its own [`Limits::max_memory`] count: the tree it builds
+    /// is bounded, and what earlier calls returned is not counted, so a large
+    /// array read item by item is limited per item, not in total.
+    ///
     /// # Errors
     ///
     /// As [`next_event`](Self::next_event), plus [`ErrorKind::DuplicateKey`]
@@ -296,11 +306,11 @@ impl<'a> Reader<'a> {
         if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
-        self.new_document_budget();
         let duplicates = self.machine.duplicates;
-        parser::build(self, duplicates)
-            .inspect_err(|&e| self.failed = Some(e))
-            .map(Some)
+        self.begin_read();
+        let built = parser::build(self, duplicates);
+        self.end_read();
+        built.inspect_err(|&e| self.failed = Some(e)).map(Some)
     }
 
     /// The kind of the next value, without consuming anything: `None` when
@@ -586,23 +596,33 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Starts the memory count afresh for a read of a whole document: one
-    /// at the top level (`depth() == 0`). A read inside a document keeps
-    /// adding to its document's count.
+    /// Enters a read that builds something (a tree or a typed value). The
+    /// outermost one starts the memory count afresh: what an earlier call
+    /// built has been handed to the caller, who may have dropped it, so only
+    /// what one call builds is bounded. Reads nested inside it (a `Value`
+    /// field of a typed decode, a `decode` called from a `FromJson` impl)
+    /// share its count. Pair with [`end_read`](Self::end_read).
     #[inline]
-    pub(crate) fn new_document_budget(&mut self) {
-        if self.machine.depth() == 0 {
+    pub(crate) fn begin_read(&mut self) {
+        if self.reading == 0 {
             self.held = 0;
         }
+        self.reading += 1;
     }
 
-    /// What the current document's reads hold, in bytes.
+    /// Leaves a read entered with [`begin_read`](Self::begin_read).
+    #[inline]
+    pub(crate) fn end_read(&mut self) {
+        self.reading = self.reading.saturating_sub(1);
+    }
+
+    /// What the current top-level read holds, in bytes.
     #[inline]
     pub(crate) const fn held(&self) -> usize {
         self.held
     }
 
-    /// Records `held` bytes held in all by the current document's reads.
+    /// Records `held` bytes held in all by the current top-level read.
     #[inline]
     pub(crate) fn set_held(&mut self, held: usize) {
         self.held = held;
@@ -614,7 +634,7 @@ impl<'a> Reader<'a> {
         self.machine.limits.max_memory
     }
 
-    /// Charges `bytes` more to the current document, refusing them, as
+    /// Charges `bytes` more to the current top-level read, refusing them, as
     /// [`ErrorKind::MemoryLimitExceeded`] at `at`, past
     /// [`Limits::max_memory`].
     #[inline]

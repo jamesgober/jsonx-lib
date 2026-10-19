@@ -370,3 +370,97 @@ fn test_display_into_a_failing_formatter_returns_the_error() {
     assert!(write!(Full, "{big:#}").is_err());
     assert!(write!(Full, "{}", json!(1)).is_err());
 }
+
+/// `max_memory` bounds what one read builds, not what a document yields
+/// over many reads: a large array read item by item, each item dropped,
+/// reads in full, as in 0.2 (verification JX3-COR-01).
+#[test]
+fn test_read_value_item_by_item_past_max_memory_reads_every_item() {
+    const ITEMS: usize = 2_000_000;
+    let mut text = String::with_capacity(ITEMS * 20 + 2);
+    text.push('[');
+    for i in 0..ITEMS {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(r#"{"id":1,"name":"x"}"#);
+    }
+    text.push(']');
+    // Over the input and value budgets, but not over the memory budget,
+    // which stays at its default.
+    let limits = Limits::new()
+        .with_max_input_bytes(1 << 30)
+        .with_max_elements(usize::MAX);
+    assert_eq!(limits.max_memory, Limits::new().max_memory);
+    let parser = Parser::new().limits(limits);
+    let mut r = parser.reader(&text);
+    assert_eq!(
+        r.next_event().ok().flatten(),
+        Some(jsonx_lib::Event::StartArray)
+    );
+    let mut read = 0usize;
+    while let Some(item) = r.read_value().unwrap() {
+        assert_eq!(item["id"], 1);
+        read += 1;
+    }
+    assert_eq!(read, ITEMS);
+    assert!(r.finish().is_ok());
+
+    // The same through typed reads, item by item, under a tight budget.
+    let tight = Parser::new().limits(limits.with_max_memory(4096));
+    let mut r = tight.reader(&text[..20 * 100_000]);
+    r.next_event().unwrap();
+    for _ in 0..99_999 {
+        let item: jsonx_lib::Value = r.decode().unwrap();
+        assert_eq!(item["name"], "x");
+    }
+}
+
+/// Under the fully default budgets: more than `max_memory` of decoded
+/// strings in all, each item far below it.
+#[test]
+fn test_read_value_default_budgets_decoded_strings_past_max_memory_read_in_full() {
+    let item = format!(r#"{{"s":"{}"}}"#, "\\n".repeat(500));
+    let count = 64_000;
+    let text = format!("[{}]", vec![item.as_str(); count].join(","));
+    assert!(text.len() < Limits::new().max_input_bytes);
+    // Each item holds its decoded string's buffer (sized from its 1000-byte
+    // source), its member, and its value: more than 64 MiB in all.
+    let per_item = 1000 + 56 + size_of::<Value>();
+    assert!(count * per_item > Limits::new().max_memory);
+    let mut r = jsonx_lib::Reader::new(&text);
+    r.next_event().unwrap();
+    let mut read = 0usize;
+    while let Some(v) = r.read_value().unwrap() {
+        assert_eq!(v["s"].as_str().map(str::len), Some(500));
+        read += 1;
+    }
+    assert_eq!(read, count);
+}
+
+/// One value over the budget is still refused, alone or nested in a typed
+/// read, where the nested trees share the read's count.
+#[test]
+fn test_read_value_one_value_past_max_memory_is_refused() {
+    let tight = Parser::new().limits(Limits::new().with_max_memory(1 << 20));
+    let big = format!("[[{}0], 1]", "0,".repeat(100_000));
+    let mut r = tight.reader(&big);
+    r.next_event().unwrap();
+    let err = r.read_value().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::MemoryLimitExceeded);
+    // 40,000 small trees, each under the budget, in one typed read: over it.
+    let many = format!("[{}{{}}]", r#"{"a":[1,2]},"#.repeat(40_000));
+    let err = tight.decode::<Vec<jsonx_lib::Value>>(&many).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        &jsonx_lib::DecodeErrorKind::Syntax(ErrorKind::MemoryLimitExceeded)
+    );
+    // Read one by one, they fit.
+    let mut r = tight.reader(&many);
+    r.next_event().unwrap();
+    let mut read = 0usize;
+    while r.read_value().unwrap().is_some() {
+        read += 1;
+    }
+    assert_eq!(read, 40_001);
+}
