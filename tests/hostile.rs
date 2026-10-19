@@ -270,3 +270,19 @@ fn pretty_printing_deep_values_is_iterative() {
         assert_eq!(back, v);
     });
 }
+
+#[test]
+fn million_deep_transcoding_through_the_push_writer_is_iterative() {
+    on_small_stack(|| {
+        let text = "[{\"k\":".repeat(MILLION / 2) + "0" + &"}]".repeat(MILLION / 2);
+        let p = Parser::new().limits(Limits::unlimited());
+        let mut out = String::new();
+        // Compact: pretty output of a million levels is quadratic in size.
+        let mut w = jsonx_lib::Writer::new(&mut out);
+        for event in p.reader(&text) {
+            assert!(event.is_ok_and(|e| w.event(&e).is_ok()));
+        }
+        assert!(w.finish().is_ok());
+        assert_eq!(out, text);
+    });
+}

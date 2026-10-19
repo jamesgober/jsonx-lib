@@ -710,7 +710,8 @@ impl ArrayWriter<'_> {
 ///
 /// Writing never fails from the implementation's point of view: an I/O
 /// error of the underlying writer is kept and returned by the call that
-/// started the write ([`to_writer`](crate::to_writer)). A type whose values nest as
+/// started the write ([`to_writer`](crate::to_writer),
+/// [`Writer::value`](crate::Writer::value)). A type whose values nest as
 /// deep as their data (a tree of its own nodes) recurses once per level;
 /// [`Value`] does not, and is the type to use for untrusted depth.
 ///

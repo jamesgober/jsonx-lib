@@ -309,7 +309,6 @@ pub fn to_writer_pretty<W: std::io::Write, T: ToJson + ?Sized>(
 }
 
 /// How much output the streaming writers collect before passing it on.
-#[cfg(feature = "std")]
 pub(crate) const CHUNK: usize = 8 * 1024;
 
 /// Writes `value` in the given [`Format`] to an [`io::Write`](std::io::Write),

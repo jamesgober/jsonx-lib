@@ -91,6 +91,7 @@ mod stream;
 mod tree;
 mod value;
 mod write;
+mod writer;
 
 pub use array::Array;
 pub use encode::{ArrayWriter, ObjectWriter, ToJson, ToJsonKey, ValueWriter, Written};
@@ -109,6 +110,7 @@ pub use write::{
 };
 #[cfg(feature = "std")]
 pub use write::{to_writer, to_writer_pretty, to_writer_with};
+pub use writer::{WriteError, Writer};
 
 /// Parses one JSON document with the default [`Limits`], refusing duplicate
 /// keys.

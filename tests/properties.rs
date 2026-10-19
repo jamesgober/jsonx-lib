@@ -10,7 +10,8 @@ use common::{
     to_ref,
 };
 use jsonx_lib::{
-    DuplicateKeys, ErrorKind, Event, Format, Limits, Parser, ToJson, Value, ValueWriter, Written,
+    DuplicateKeys, ErrorKind, Event, Format, Limits, Parser, ToJson, Value, ValueWriter, Writer,
+    Written,
 };
 use proptest::{prelude::*, sample::Index};
 
@@ -219,6 +220,21 @@ proptest! {
         // The default formats are the 0.2 layouts.
         prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::compact()), jsonx_lib::to_string(&v));
         prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::pretty()), jsonx_lib::to_string_pretty(&v));
+    }
+
+    /// The push writer, fed a reader's events, writes what the value writers
+    /// write, in every layout.
+    #[test]
+    fn prop_events_through_the_writer_match_the_value_writer(v in value(), pretty in any::<bool>()) {
+        let format = if pretty { Format::pretty() } else { Format::compact() };
+        let text = jsonx_lib::to_string(&v);
+        let mut out = String::new();
+        let mut w = Writer::new(&mut out).with_format(format);
+        for event in GRAMMAR_ONLY.reader(&text) {
+            prop_assert!(w.event(&event.unwrap_or(Event::Null)).is_ok());
+        }
+        prop_assert!(w.finish().is_ok());
+        prop_assert_eq!(out, jsonx_lib::to_string_with(&v, format));
     }
 
     /// Clone, equality, and `into_owned` agree with each other.
