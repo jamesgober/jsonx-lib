@@ -186,7 +186,10 @@ fn typed_access() {
     assert_eq!(v["n"], -3);
     assert_eq!(v["n"], -3i8);
     assert_eq!(v["u"], u64::MAX);
+    // `usize` is 32 bits on some targets: compare as `u64` only where it is 64.
+    #[cfg(target_pointer_width = "64")]
     assert_eq!(v["u"], usize::MAX as u64);
+    assert_eq!(v["u"], u64::MAX);
     assert_eq!(v["f"], 0.25);
     assert_ne!(v["s"], "y");
     assert_eq!(v["s"], String::from("x"));
