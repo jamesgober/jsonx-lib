@@ -95,6 +95,10 @@ struct OpenObject {
 #[derive(Clone, Copy, Debug)]
 struct KeyMark {
     print: u64,
+    /// The opening quote's offset in the whole input, not in the current
+    /// text: `rebase` drops the front of the text while the key's object is
+    /// still open, and the key's offset must survive that
+    /// (`Machine::dropped` converts).
     quote: usize,
 }
 
@@ -151,6 +155,10 @@ pub(crate) struct Machine {
     objects: SmallStack<OpenObject, INLINE_OBJECTS>,
     /// Each key of the open objects.
     keys: SmallStack<KeyMark, INLINE_KEYS>,
+    /// The bytes dropped from the front of the text so far by
+    /// [`rebase`](Self::rebase): a text offset plus this is an offset in the
+    /// whole input.
+    dropped: usize,
     /// With `copy_keys`: each key's decoded text, as a range of `arena`
     /// (one for each entry of `keys`).
     copies: Vec<(usize, usize)>,
@@ -181,6 +189,7 @@ impl Machine {
                 suspect: false,
             }),
             keys: SmallStack::new(KeyMark { print: 0, quote: 0 }),
+            dropped: 0,
             copies: Vec::new(),
             arena: String::new(),
             order: Vec::new(),
@@ -230,6 +239,8 @@ impl Machine {
     /// dropped part reads as beginning at 0; the stream reader keeps its own
     /// absolute copy of that offset.
     pub(crate) fn rebase(&mut self, by: usize) {
+        // Key offsets are kept in whole-input terms: nothing to shift there.
+        self.dropped += by;
         self.pos -= by;
         self.last = self.last.saturating_sub(by);
         self.pending = match self.pending {
@@ -547,7 +558,16 @@ impl Machine {
     /// repeat.
     #[cold]
     fn check_object(&mut self, src: &str, open: OpenObject) -> Result<(), Error> {
-        let quotes: Vec<usize> = self.keys.iter_from(open.keys).map(|k| k.quote).collect();
+        // Back to text offsets. A key whose quote was dropped from the text
+        // (only with `copy_keys`, whose texts come from the arena) wraps
+        // below zero here; the stream reader's error conversion adds the
+        // dropped length back with the same wrapping, so the reported
+        // offset is exact either way.
+        let quotes: Vec<usize> = self
+            .keys
+            .iter_from(open.keys)
+            .map(|k| k.quote.wrapping_sub(self.dropped))
+            .collect();
         let repeat = if self.copy_keys {
             let copies = self.copies.get(open.keys..).unwrap_or(&[]);
             let arena = self.arena.as_str();
@@ -594,7 +614,10 @@ impl Machine {
                 open.suspect = true;
             }
         }
-        self.keys.push(KeyMark { print, quote });
+        self.keys.push(KeyMark {
+            print,
+            quote: quote + self.dropped,
+        });
     }
 
     /// The fingerprint of the key at `quote..end` when its decoded text is

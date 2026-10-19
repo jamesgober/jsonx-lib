@@ -841,7 +841,11 @@ fn halt<T>(
         (true, _) if !machine.complete => return Ok(Step::NeedInput),
         // The valid text ends where the input stops being UTF-8.
         (true, Some(at)) => Error::new(ErrorKind::InvalidUtf8, at),
-        _ => Error::new(e.kind(), e.offset() + base),
+        // Wrapping: a repeated key's quote can lie in the dropped front of
+        // the buffer, where its text offset wrapped below zero (see
+        // `Machine::check_object`); adding `base` back gives its exact
+        // offset in the input.
+        _ => Error::new(e.kind(), e.offset().wrapping_add(base)),
     };
     *failed = Some(e);
     Err(e)

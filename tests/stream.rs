@@ -173,6 +173,43 @@ fn ops() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![Just(vec![0u8]), prop::collection::vec(any::<u8>(), 1..16),]
 }
 
+/// Documents over the stream reader's 4 KiB compaction point, with repeated
+/// keys (some spelled with escapes) on either side of a long member: the
+/// key offsets must survive the front of the buffer being dropped.
+fn large_with_repeats() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec!["a", "b", "id", "method", "BSu0061", "meBSu0074hod"]);
+    let member = (key, 0u32..100).prop_map(|(k, v)| format!("\"{}\": {v}", k.replace("BS", "\\")));
+    let pad = (4100usize..12_000, any::<bool>()).prop_map(|(n, string)| {
+        if string {
+            format!("\"pad\": \"{}\"", "x".repeat(n))
+        } else {
+            format!("\"pad\": [{}0]", "0,".repeat(n / 2))
+        }
+    });
+    (
+        prop::collection::vec(member, 0..6),
+        pad,
+        prop::collection::vec(member_again(), 0..6),
+        0usize..3,
+    )
+        .prop_map(|(before, pad, after, nest)| {
+            let mut members = before;
+            members.push(pad);
+            members.extend(after);
+            let object = format!("{{{}}}", members.join(", "));
+            match nest {
+                0 => object,
+                1 => format!("[{object}, {object}]"),
+                _ => format!("{{\"outer\": {object}, \"outer\": 1}}"),
+            }
+        })
+}
+
+fn member_again() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec!["a", "b", "id", "method", "BSu0061", "meBSu0074hod"]);
+    (key, 0u32..100).prop_map(|(k, v)| format!("\"{}\": {v}", k.replace("BS", "\\")))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2048))]
 
@@ -306,4 +343,61 @@ fn test_stream_read_from_small_io_reads_reads_the_whole_value() {
         tiny.next_event().err().map(|e| e.kind()),
         Some(ErrorKind::InputTooLarge)
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Past the compaction point: every error (repeated keys included) at
+    /// the complete reader's offset, in any chunks.
+    #[test]
+    fn prop_large_documents_with_repeated_keys_match_the_complete_reader(text in large_with_repeats(), cuts in prop::collection::vec(0usize..16_000, 0..12), ops in ops()) {
+        for parser in [Parser::new(), GRAMMAR_ONLY] {
+            let want = run_reader(&parser, &text, &ops, budget(text.len()));
+            prop_assert_eq!(run_stream(&parser, text.as_bytes(), &cuts, &ops), want);
+        }
+    }
+}
+
+#[test]
+fn test_stream_repeated_key_offset_survives_compaction() {
+    let pad = "0,".repeat(3000);
+    let docs = [
+        format!(r#"{{"a":1,"a":2,"x":[{pad}0]}}"#),
+        format!(r#"[{{"id":1,"method":"initialize","method":"shutdown","params":[{pad}0]}}]"#),
+        format!(r#"{{"x":[{pad}0],"a":1,"BSu0061":2}}"#).replace("BS", "\\"),
+    ];
+    for doc in &docs {
+        let want = Parser::new().parse(doc).unwrap_err();
+        assert_eq!(want.kind(), ErrorKind::DuplicateKey);
+        for chunk in [1, 7, 1000, 4096, 5000] {
+            let mut r = StreamReader::new();
+            let mut got = None;
+            'feed: for piece in doc.as_bytes().chunks(chunk) {
+                r.feed(piece).unwrap();
+                loop {
+                    match r.next_event() {
+                        Ok(Step::Ready(Some(_))) => {}
+                        Ok(Step::Ready(None)) => break 'feed,
+                        Ok(Step::NeedInput) => break,
+                        Err(e) => {
+                            got = Some(e);
+                            break 'feed;
+                        }
+                    }
+                }
+            }
+            assert_eq!(got, Some(want), "{chunk}-byte chunks");
+        }
+        // Every two-way split.
+        for cut in (0..doc.len()).step_by(97) {
+            let ops = [0u8];
+            let whole = run_reader(&Parser::new(), doc, &ops, budget(doc.len()));
+            assert_eq!(
+                run_stream(&Parser::new(), doc.as_bytes(), &[cut], &ops),
+                whole,
+                "cut at {cut}"
+            );
+        }
+    }
 }
