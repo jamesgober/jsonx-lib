@@ -320,6 +320,38 @@ impl DecodeError {
         out
     }
 
+    /// The error's line and column in `input`, from 1, the column in
+    /// characters; see [`Error::line_col`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let text = "{\n  \"n\": \"seven\"\n}";
+    /// let err = jsonx_lib::from_str::<std::collections::BTreeMap<String, u8>>(text).unwrap_err();
+    /// assert_eq!(err.line_col(text), (2, 8));
+    /// ```
+    #[must_use]
+    pub fn line_col(&self, input: impl AsRef<[u8]>) -> (usize, usize) {
+        let at = crate::error::locate(input.as_ref(), self.0.offset);
+        (at.line + 1, at.chars + 1)
+    }
+
+    /// The error's position in `input` as LSP counts it (from 0, the
+    /// character in UTF-16 units); see [`Error::utf16_position`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let text = "[1,\n \"x\"]";
+    /// let err = jsonx_lib::from_str::<Vec<u8>>(text).unwrap_err();
+    /// assert_eq!(err.utf16_position(text), (1, 1));
+    /// ```
+    #[must_use]
+    pub fn utf16_position(&self, input: impl AsRef<[u8]>) -> (usize, usize) {
+        let at = crate::error::locate(input.as_ref(), self.0.offset);
+        (at.line, at.utf16)
+    }
+
     /// The parse error, for a [`DecodeErrorKind::Syntax`] error.
     ///
     /// # Examples
