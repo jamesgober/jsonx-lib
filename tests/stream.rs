@@ -215,7 +215,7 @@ proptest! {
 }
 
 #[test]
-fn one_byte_at_a_time_is_linear() {
+fn test_stream_one_byte_chunks_cost_linear_time() {
     // Quadratic rescanning of a token cut by every chunk boundary would take
     // minutes here: 4 MiB of string, 4 MiB of digits, 4 MiB of whitespace,
     // each fed a byte at a time.
@@ -242,7 +242,7 @@ fn one_byte_at_a_time_is_linear() {
 }
 
 #[test]
-fn a_duplicate_is_reported_before_a_later_syntax_error_as_reader_does() {
+fn test_stream_read_value_duplicate_before_syntax_error_matches_reader() {
     let text = r#"[{"a": 1, "a": 2}, x]"#;
     let mut r = jsonx_lib::Reader::new(text);
     let want = r.read_value().err();
@@ -257,7 +257,7 @@ fn a_duplicate_is_reported_before_a_later_syntax_error_as_reader_does() {
 
 #[cfg(feature = "std")]
 #[test]
-fn read_from_an_io_source_in_small_reads() {
+fn test_stream_read_from_small_io_reads_reads_the_whole_value() {
     struct Trickle<'a>(&'a [u8]);
     impl std::io::Read for Trickle<'_> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {

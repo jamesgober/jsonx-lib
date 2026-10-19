@@ -21,7 +21,7 @@ fn on_small_stack(f: impl FnOnce() + Send + 'static) {
 }
 
 #[test]
-fn million_deep_nesting_is_refused_cleanly_by_default() {
+fn test_million_deep_nesting_default_limits_refused_at_the_depth_budget() {
     let open = "[".repeat(MILLION);
     assert_eq!(
         kind_at(jsonx_lib::parse(&open)),
@@ -46,7 +46,7 @@ fn million_deep_nesting_is_refused_cleanly_by_default() {
 }
 
 #[test]
-fn million_deep_unclosed_input_is_unexpected_end_without_recursion() {
+fn test_million_deep_unclosed_input_unlimited_is_unexpected_end() {
     on_small_stack(|| {
         let open = "[".repeat(MILLION);
         let p = Parser::new().limits(Limits::unlimited());
@@ -58,7 +58,7 @@ fn million_deep_unclosed_input_is_unexpected_end_without_recursion() {
 }
 
 #[test]
-fn million_deep_value_parses_writes_clones_compares_and_drops_without_recursion() {
+fn test_million_deep_value_small_stack_every_operation_succeeds() {
     on_small_stack(|| {
         let text = "[".repeat(MILLION) + &"]".repeat(MILLION);
         let p = Parser::new().limits(Limits::unlimited());
@@ -79,7 +79,7 @@ fn million_deep_value_parses_writes_clones_compares_and_drops_without_recursion(
 }
 
 #[test]
-fn million_deep_objects_round_trip_without_recursion() {
+fn test_million_deep_objects_small_stack_round_trip() {
     on_small_stack(|| {
         let text = "{\"k\":".repeat(MILLION) + "null" + &"}".repeat(MILLION);
         let p = Parser::new().limits(Limits::unlimited());
@@ -90,7 +90,7 @@ fn million_deep_objects_round_trip_without_recursion() {
 }
 
 #[test]
-fn deep_value_built_in_code_drops_without_recursion() {
+fn test_deep_value_built_in_code_small_stack_drops() {
     on_small_stack(|| {
         let mut v = json!(null);
         for i in 0..MILLION {
@@ -107,7 +107,7 @@ fn deep_value_built_in_code_drops_without_recursion() {
 }
 
 #[test]
-fn every_budget_at_its_boundary() {
+fn test_every_budget_at_its_boundary_refuses_only_past_it() {
     let p = |l: Limits| Parser::new().limits(l);
 
     // Depth: `[[1]]` is depth 2.
@@ -182,7 +182,7 @@ fn every_budget_at_its_boundary() {
 }
 
 #[test]
-fn default_budgets_refuse_oversized_documents() {
+fn test_default_budgets_oversized_documents_are_refused() {
     let limits = Limits::new();
     let digits = "1".repeat(limits.max_number_bytes + 1);
     assert_eq!(
@@ -214,7 +214,7 @@ fn default_budgets_refuse_oversized_documents() {
 }
 
 #[test]
-fn wide_objects_check_duplicates_without_quadratic_cost() {
+fn test_wide_objects_duplicate_check_is_not_quadratic() {
     // 200k distinct keys: a quadratic duplicate check would take minutes.
     let n = 200_000;
     let mut text = String::from("{");
@@ -246,7 +246,7 @@ fn wide_objects_check_duplicates_without_quadratic_cost() {
 }
 
 #[test]
-fn long_escape_runs_decode_in_linear_time() {
+fn test_long_escape_runs_decode_in_linear_time() {
     let body = "\\n\\u00e9\\ud83d\\ude00".repeat(100_000);
     let text = format!("\"{body}\"");
     let v = jsonx_lib::parse(&text).unwrap_or_default();
@@ -254,7 +254,7 @@ fn long_escape_runs_decode_in_linear_time() {
 }
 
 #[test]
-fn pretty_printing_deep_values_is_iterative() {
+fn test_pretty_printing_deep_values_small_stack_succeeds() {
     on_small_stack(|| {
         let depth = 2_000;
         let text = "[".repeat(depth) + &"]".repeat(depth);
@@ -272,7 +272,7 @@ fn pretty_printing_deep_values_is_iterative() {
 }
 
 #[test]
-fn million_deep_transcoding_through_the_push_writer_is_iterative() {
+fn test_push_writer_million_deep_transcoding_small_stack_succeeds() {
     on_small_stack(|| {
         let text = "[{\"k\":".repeat(MILLION / 2) + "0" + &"}]".repeat(MILLION / 2);
         let p = Parser::new().limits(Limits::unlimited());

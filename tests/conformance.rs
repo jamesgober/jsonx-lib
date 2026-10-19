@@ -839,7 +839,7 @@ fn check_reference(name: &str, bytes: &[u8], kind: ErrorKind, offset: usize) {
 }
 
 #[test]
-fn y_cases_are_accepted_and_match_the_reference() {
+fn test_y_cases_are_accepted_and_match_the_reference() {
     for &(name, text) in Y {
         let value = jsonx_lib::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
         let reference = common::parse(text.as_bytes());
@@ -857,7 +857,7 @@ fn y_cases_are_accepted_and_match_the_reference() {
 }
 
 #[test]
-fn n_cases_are_refused_at_the_exact_offset() {
+fn test_n_cases_are_refused_at_the_exact_offset() {
     for &(name, bytes, kind, offset) in N {
         let err = Parser::new().parse_bytes(bytes).err();
         let got = err.map(|e| (e.kind(), e.offset()));
@@ -870,7 +870,7 @@ fn n_cases_are_refused_at_the_exact_offset() {
 }
 
 #[test]
-fn i_cases_follow_this_crates_documented_choice() {
+fn test_i_cases_follow_the_documented_choice() {
     for &(name, bytes, expect) in I {
         let got = Parser::new().parse_bytes(bytes);
         match expect {
@@ -894,7 +894,7 @@ fn i_cases_follow_this_crates_documented_choice() {
 }
 
 #[test]
-fn i_numbers_keep_their_text_and_convert_honestly() {
+fn test_i_numbers_keep_their_text_and_convert_exactly() {
     let v = jsonx_lib::parse("[1.5e+9999, 123e-10000000, -123123123123123123123123123123]")
         .unwrap_or_default();
     assert_eq!(v[0].as_number().map(|n| n.as_str()), Some("1.5e+9999"));
@@ -909,7 +909,7 @@ fn i_numbers_keep_their_text_and_convert_honestly() {
 }
 
 #[test]
-fn i_deep_nesting_is_accepted_with_a_larger_budget() {
+fn test_i_deep_nesting_larger_budget_is_accepted() {
     let p = Parser::new().limits(Limits::new().with_max_depth(500));
     assert!(p.parse_bytes(NESTED_500).is_ok());
     let p = Parser::new().limits(Limits::new().with_max_depth(499));
@@ -921,7 +921,7 @@ fn i_deep_nesting_is_accepted_with_a_larger_budget() {
 }
 
 #[test]
-fn decoded_strings_are_exact() {
+fn test_decoded_strings_escapes_decode_exactly() {
     let cases: &[(&str, &str)] = &[
         ("[\"\\uD801\\udc37\"]", "\u{10437}"),
         ("[\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"]", "\"\\/\u{8}\u{c}\n\r\t"),
@@ -940,7 +940,7 @@ fn decoded_strings_are_exact() {
 }
 
 #[test]
-fn reader_events_for_a_mixed_document() {
+fn test_reader_events_mixed_document_come_in_order() {
     let events: Result<Vec<Event<'_>>, _> =
         Reader::new("{\"a\":[1,\"x\",null],\"b\":{}}").collect();
     let events = events.unwrap_or_default();
@@ -951,7 +951,7 @@ fn reader_events_for_a_mixed_document() {
 }
 
 #[test]
-fn reference_agrees_on_structure_of_y_values() {
+fn test_reference_y_values_have_the_same_structure() {
     // A spot check that the reference really decodes, not just accepts.
     let r = common::parse(b"{\"k\":[true,\"v\"]}").result;
     assert_eq!(

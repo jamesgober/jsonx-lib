@@ -349,7 +349,7 @@ pub fn to_ref(v: &jsonx_lib::Value<'_>) -> RefValue {
 }
 
 #[test]
-fn reference_self_check() {
+fn test_reference_parser_self_check() {
     let ok = |s: &str| parse(s.as_bytes()).result.is_ok();
     assert!(ok(r#"{"a":[1,-2.5e+3,true,false,null,"x"]}"#));
     assert!(!ok("[1,]"));

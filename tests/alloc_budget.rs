@@ -68,7 +68,7 @@ fn kind<T>(r: &Result<T, jsonx_lib::Error>) -> Option<ErrorKind> {
 }
 
 #[test]
-fn budgets_refuse_before_allocating() {
+fn test_budgets_hostile_input_refused_before_allocating() {
     let tight = Parser::new().limits(
         Limits::new()
             .with_max_string_bytes(1024)

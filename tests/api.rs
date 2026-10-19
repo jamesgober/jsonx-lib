@@ -8,7 +8,7 @@ use jsonx_lib::{
 };
 
 #[test]
-fn strings_borrow_unless_they_had_escapes() {
+fn test_strings_without_escapes_borrow_from_the_input() {
     let text = "[\"plain\", \"esc\\taped\", 12.50]";
     let v = jsonx_lib::parse(text).unwrap_or_default();
     assert!(matches!(&v[0], Value::String(Cow::Borrowed("plain"))));
@@ -20,7 +20,7 @@ fn strings_borrow_unless_they_had_escapes() {
 }
 
 #[test]
-fn reader_handles_a_json_rpc_envelope_like_lsp_lang() {
+fn test_reader_json_rpc_envelope_reads_members_and_raw_params() {
     struct Envelope<'a> {
         id: Option<&'a str>,
         method: Option<Cow<'a, str>>,
@@ -78,7 +78,7 @@ fn reader_handles_a_json_rpc_envelope_like_lsp_lang() {
 }
 
 #[test]
-fn reader_positioning_rules() {
+fn test_reader_raw_reads_where_no_value_comes_consume_nothing() {
     let mut r = Reader::new(r#"{"a": [1, 2], "b": {}}"#);
     // At a key, there is no value to read: nothing is consumed.
     assert_eq!(r.next_event().ok().flatten(), Some(Event::StartObject));
@@ -101,7 +101,7 @@ fn reader_positioning_rules() {
 }
 
 #[test]
-fn reader_errors_latch_and_the_iterator_yields_them_once() {
+fn test_reader_after_an_error_returns_the_same_error() {
     let mut r = Reader::new("[1 2]");
     let _start = r.next_event();
     let _one = r.next_event();
@@ -126,7 +126,7 @@ fn reader_errors_latch_and_the_iterator_yields_them_once() {
 }
 
 #[test]
-fn read_value_applies_the_duplicate_policy() {
+fn test_read_value_with_duplicates_applies_the_policy() {
     let text = r#"{"x": {"k": 1, "k": 2}}"#;
     let mut r = Reader::new(text);
     let _start = r.next_event();
@@ -145,7 +145,7 @@ fn read_value_applies_the_duplicate_policy() {
 }
 
 #[test]
-fn duplicate_policies_apply_at_every_depth() {
+fn test_duplicate_policies_nested_objects_apply_at_every_depth() {
     let text = r#"[{"a": {"b": 1, "b": 2}, "a": 3}]"#;
     let first = Parser::new()
         .duplicate_keys(DuplicateKeys::First)
@@ -168,7 +168,7 @@ fn duplicate_policies_apply_at_every_depth() {
 }
 
 #[test]
-fn typed_access() {
+fn test_value_accessors_wrong_shape_return_none() {
     let v =
         json!({ "n": -3, "u": 18446744073709551615u64, "f": 0.25, "s": "x", "b": true, "z": null });
     assert_eq!(v["n"].as_i64(), Some(-3));
@@ -206,7 +206,7 @@ fn typed_access() {
 }
 
 #[test]
-fn equality_is_exact() {
+fn test_value_equality_numbers_and_order_compare_exactly() {
     assert_ne!(jsonx_lib::parse("1").ok(), jsonx_lib::parse("1.0").ok());
     assert_ne!(
         jsonx_lib::parse(r#"{"a":1,"b":2}"#).ok(),
@@ -225,7 +225,7 @@ fn equality_is_exact() {
 
 #[cfg(feature = "std")]
 #[test]
-fn writers_agree_and_propagate_io_errors() {
+fn test_writers_io_failure_returns_the_error() {
     let v = json!({ "list": [1, "two", null], "nested": { "ok": true } });
     let mut buf = Vec::new();
     assert!(jsonx_lib::to_writer(&mut buf, &v).is_ok());
@@ -254,7 +254,7 @@ fn writers_agree_and_propagate_io_errors() {
 }
 
 #[test]
-fn errors_display_kind_and_offset() {
+fn test_error_display_names_kind_and_offset() {
     let err = jsonx_lib::parse("[1,]").err();
     assert_eq!(
         err.map(|e| e.to_string()),
@@ -265,7 +265,7 @@ fn errors_display_kind_and_offset() {
 }
 
 #[test]
-fn values_outlive_their_text_when_owned() {
+fn test_value_into_owned_outlives_its_input() {
     let owned: Value<'static> = {
         let text = String::from("{\"k\": [\"v\\n\", 1e5]}");
         jsonx_lib::parse(&text)
@@ -277,7 +277,7 @@ fn values_outlive_their_text_when_owned() {
 }
 
 #[test]
-fn object_editing_keeps_order() {
+fn test_object_insert_push_remove_keep_member_order() {
     let mut v = jsonx_lib::parse(r#"{"c": 1, "a": 2, "b": 3}"#)
         .map(Value::into_owned)
         .unwrap_or_default();
