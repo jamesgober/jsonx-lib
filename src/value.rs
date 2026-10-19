@@ -5,7 +5,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{fmt, ops::Index};
+use core::{
+    fmt,
+    hash::{Hash, Hasher},
+    ops::Index,
+};
 
 use crate::{Array, Number, Object, tree};
 
@@ -158,6 +162,71 @@ impl<'a> Value<'a> {
         matches!(self, Self::Null)
     }
 
+    /// Whether the value is `true` or `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(jsonx_lib::json!(false).is_bool());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_bool(&self) -> bool {
+        matches!(self, Self::Bool(_))
+    }
+
+    /// Whether the value is a number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(jsonx_lib::json!(1.5).is_number());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_number(&self) -> bool {
+        matches!(self, Self::Number(_))
+    }
+
+    /// Whether the value is a string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(jsonx_lib::json!("s").is_string());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_string(&self) -> bool {
+        matches!(self, Self::String(_))
+    }
+
+    /// Whether the value is an array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(jsonx_lib::json!([]).is_array());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_array(&self) -> bool {
+        matches!(self, Self::Array(_))
+    }
+
+    /// Whether the value is an object.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(jsonx_lib::json!({}).is_object());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_object(&self) -> bool {
+        matches!(self, Self::Object(_))
+    }
+
     /// The boolean, if the value is one.
     ///
     /// # Examples
@@ -223,6 +292,34 @@ impl<'a> Value<'a> {
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         self.as_number().and_then(Number::as_u64)
+    }
+
+    /// The value as an `i128`: see [`Number::as_i128`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let doc = jsonx_lib::parse("-170141183460469231731687303715884105728")?;
+    /// assert_eq!(doc.as_i128(), Some(i128::MIN));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn as_i128(&self) -> Option<i128> {
+        self.as_number().and_then(Number::as_i128)
+    }
+
+    /// The value as a `u128`: see [`Number::as_u128`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let doc = jsonx_lib::parse("340282366920938463463374607431768211455")?;
+    /// assert_eq!(doc.as_u128(), Some(u128::MAX));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn as_u128(&self) -> Option<u128> {
+        self.as_number().and_then(Number::as_u128)
     }
 
     /// The value as an `f64`: see [`Number::as_f64`]. Integers convert too.
@@ -412,6 +509,37 @@ impl<'a> Value<'a> {
         Some(target)
     }
 
+    /// A mutable reference to the value at a JSON Pointer, as
+    /// [`pointer`](Self::pointer) finds it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut v = jsonx_lib::json!({ "a": [1, 2] });
+    /// if let Some(item) = v.pointer_mut("/a/1") {
+    ///     *item = "two".into();
+    /// }
+    /// assert_eq!(v.to_string(), r#"{"a":[1,"two"]}"#);
+    /// assert!(v.pointer_mut("/a/9").is_none());
+    /// ```
+    #[must_use]
+    pub fn pointer_mut(&mut self, pointer: &str) -> Option<&mut Value<'a>> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        let rest = pointer.strip_prefix('/')?;
+        let mut target = self;
+        for token in rest.split('/') {
+            let token = unescape_pointer_token(token)?;
+            target = match target {
+                Self::Object(o) => o.get_mut(&token)?,
+                Self::Array(a) => a.get_mut(array_index(&token)?)?,
+                _ => return None,
+            };
+        }
+        Some(target)
+    }
+
     /// Takes the value out, leaving `null` in its place.
     ///
     /// # Examples
@@ -449,7 +577,7 @@ impl<'a> Value<'a> {
 }
 
 /// Decodes `~1` and `~0` in one JSON Pointer reference token.
-fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
+pub(crate) fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
     if !token.contains('~') {
         return Some(Cow::Borrowed(token));
     }
@@ -470,7 +598,7 @@ fn unescape_pointer_token(token: &str) -> Option<Cow<'_, str>> {
 }
 
 /// An RFC 6901 array index: `0`, or a decimal without a leading zero.
-fn array_index(token: &str) -> Option<usize> {
+pub(crate) fn array_index(token: &str) -> Option<usize> {
     let digits = token.as_bytes();
     let canonical = !digits.is_empty()
         && digits.iter().all(u8::is_ascii_digit)
@@ -498,6 +626,14 @@ impl PartialEq for Value<'_> {
 }
 
 impl Eq for Value<'_> {}
+
+impl Hash for Value<'_> {
+    /// Hashes consistently with `==`: numbers by their text, object members
+    /// in order. Iterative at any depth.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        tree::hash(self, state);
+    }
+}
 
 impl<'a> Index<&str> for Value<'a> {
     type Output = Value<'a>;
@@ -668,6 +804,28 @@ impl PartialEq<bool> for Value<'_> {
     }
 }
 
+impl PartialEq<f32> for Value<'_> {
+    /// Compares the number's value, read as an `f32` (see
+    /// [`Number::as_f32`]).
+    fn eq(&self, other: &f32) -> bool {
+        self.as_number().and_then(Number::as_f32) == Some(*other)
+    }
+}
+
+impl PartialEq<i128> for Value<'_> {
+    /// True when the value is an integer number equal to `other`.
+    fn eq(&self, other: &i128) -> bool {
+        self.as_i128() == Some(*other)
+    }
+}
+
+impl PartialEq<u128> for Value<'_> {
+    /// True when the value is an integer number equal to `other`.
+    fn eq(&self, other: &u128) -> bool {
+        self.as_u128() == Some(*other)
+    }
+}
+
 impl PartialEq<f64> for Value<'_> {
     /// Compares the number's value, so `1.0`, `1`, and `1e0` all equal `1.0`.
     fn eq(&self, other: &f64) -> bool {
@@ -734,6 +892,70 @@ mod tests {
         assert_eq!(unescape_pointer_token("a~1b~0c").as_deref(), Some("a/b~c"));
         assert_eq!(unescape_pointer_token("~2"), None);
         assert_eq!(unescape_pointer_token("~"), None);
+    }
+
+    #[test]
+    fn test_predicates_wide_integers_and_comparisons() {
+        let v = crate::json!([null, true, 1, "s", [], {}]);
+        let kinds: alloc::vec::Vec<[bool; 5]> = v
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| {
+                        [
+                            x.is_bool(),
+                            x.is_number(),
+                            x.is_string(),
+                            x.is_array(),
+                            x.is_object(),
+                        ]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(kinds.iter().filter(|k| k.iter().any(|&b| b)).count(), 5);
+        assert!(v[0].is_null() && !v[1].is_null());
+        assert_eq!(Value::from(u128::MAX), u128::MAX);
+        assert_eq!(Value::from(i128::MIN), i128::MIN);
+        assert_ne!(Value::from(1), 2i128);
+        assert_eq!(Value::from(0.5), 0.5f32);
+        assert_ne!(Value::from("0.5"), 0.5f32);
+        assert_eq!(Value::from(-1).as_u128(), None);
+    }
+
+    /// FNV-1a, so the test needs nothing from `std`.
+    struct Fnv(u64);
+
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hash_agrees_with_eq() {
+        let h = |v: &Value<'_>| {
+            let mut state = Fnv(0xcbf2_9ce4_8422_2325);
+            v.hash(&mut state);
+            state.finish()
+        };
+        let a = crate::json!({ "k": [1, { "x": "y" }], "m": null });
+        let b = crate::parse(r#"{"k":[1,{"x":"y"}],"m":null}"#).unwrap_or_default();
+        assert_eq!(a, b);
+        assert_eq!(h(&a), h(&b));
+        let reordered = crate::parse(r#"{"m":null,"k":[1,{"x":"y"}]}"#).unwrap_or_default();
+        assert_ne!(h(&a), h(&reordered));
+        assert_ne!(
+            h(&Value::from(1)),
+            h(&crate::parse("1.0").unwrap_or_default())
+        );
+        assert_ne!(h(&crate::json!([[]])), h(&crate::json!([[], []])));
+        assert_ne!(h(&crate::json!(["a"])), h(&crate::json!({ "a": null })));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Tier 2 and 3: a configured parser, and the pull reader picking a JSON-RPC
-//! envelope apart without building a tree, keeping `params` as raw text.
+//! envelope apart without building a tree, keeping `params` as raw text,
+//! and refusing a message that repeats a member.
 //!
 //! Run with `cargo run --example rpc_envelope`.
 
@@ -43,5 +44,28 @@ fn main() -> Result<(), jsonx_lib::Error> {
         let p = WIRE.parse(raw)?;
         println!("line   = {:?}", p["position"]["line"].as_u64());
     }
+
+    // A message that repeats a member cannot smuggle a second value past
+    // this loop: the reader refuses the object at its `}`, before the loop
+    // ends, exactly as `parse` refuses it.
+    let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","method":"shutdown"}"#;
+    let mut reader = WIRE.reader(smuggled);
+    let mut outcome = Ok(());
+    if reader.next_event()? == Some(Event::StartObject) {
+        loop {
+            match reader.next_event() {
+                Ok(Some(Event::Key(_))) => {
+                    let _value = reader.read_raw();
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+    }
+    println!("smuggled method refused: {outcome:?}");
+    assert!(outcome.is_err());
     Ok(())
 }

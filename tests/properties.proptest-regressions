@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1d2a3788d9ba22604650214da922777299daf736d1707ba5f35fad652c0099be # shrinks to text = "tru{"
+cc bae516607be7bd4e746805a8c1e77ba5caaea1fa84dfbeb16c12813dbea0ed45 # shrinks to text = "{\"a\":{\"c\\n\":1,\"c\\n\":1},\"a\":1}", cut = Index(13527612320720337852)

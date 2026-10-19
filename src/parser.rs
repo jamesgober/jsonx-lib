@@ -1,11 +1,13 @@
 //! The configured parser and the tree builder.
 
 use alloc::{borrow::Cow, vec::Vec};
+use core::mem::size_of;
 
 use crate::{
-    Array, Limits, Object, Reader, Value,
+    Array, Limits, Object, Reader, Value, dupes,
     error::{Error, ErrorKind},
     reader::Event,
+    small::SmallStack,
     tree::Member,
 };
 
@@ -17,6 +19,12 @@ use crate::{
 /// reader than another sees. The default is therefore to refuse them.
 /// Keys are compared after unescaping, so `"a"` and `"\u0061"` are the same
 /// key.
+///
+/// The policy applies to every way of reading: [`Parser::parse`], and the
+/// [`Reader`]s it makes, whose events and raw slices refuse a duplicate
+/// under `Error`. Under `First`, `Last`, and `KeepAll` a reader's events
+/// carry every member as written; the values a parse or
+/// [`Reader::read_value`] builds apply the policy.
 ///
 /// The enum is `#[non_exhaustive]`: a later version may add a policy.
 ///
@@ -53,7 +61,47 @@ pub enum DuplicateKeys {
     /// as inserting each member into an ordered map would.
     Last,
     /// Keep every member as written. The writer reproduces the duplicates.
+    /// [`Object::get`](crate::Object::get) then finds the *first* member with
+    /// a key (`serde_json`'s map keeps the last), and typed reads of a struct
+    /// field or a map keep the last value.
     KeepAll,
+}
+
+/// How typed reads ([`FromJson`](crate::FromJson)) of integers treat a
+/// number written as a fraction or with an exponent.
+///
+/// JSON has one number type, and writers differ on how they spell a whole
+/// number: some write `100`, some `100.0` or `1e2`. The default reads an
+/// integer type only from integer text, as [`Number::as_i64`](crate::Number::as_i64)
+/// does, so a value that was meant as a float is never silently taken as an
+/// integer. `WholeValues` also accepts any spelling of a whole number, read
+/// exactly ([`Number::whole_value`](crate::Number::whole_value)); a
+/// fractional value is still refused.
+///
+/// The enum is `#[non_exhaustive]`.
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{Numbers, Parser};
+///
+/// assert!(Parser::new().decode::<u32>("1e2").is_err());
+/// let lenient = Parser::new().numbers(Numbers::WholeValues);
+/// assert_eq!(lenient.decode::<u32>("1e2")?, 100);
+/// assert_eq!(lenient.decode::<u32>("7.0")?, 7);
+/// assert!(lenient.decode::<u32>("7.5").is_err());
+/// # Ok::<(), jsonx_lib::DecodeError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Numbers {
+    /// Integers from integer text only (`100`); `1e2` and `100.0` are
+    /// refused for an integer type. The default.
+    #[default]
+    IntegerText,
+    /// Integers from any spelling of a whole number (`100`, `1e2`,
+    /// `100.0`), within `i128`'s range for exponent or fraction forms.
+    WholeValues,
 }
 
 /// A configured parser: [`Limits`] and a [`DuplicateKeys`] policy.
@@ -82,6 +130,7 @@ pub enum DuplicateKeys {
 pub struct Parser {
     limits: Limits,
     duplicates: DuplicateKeys,
+    numbers: Numbers,
 }
 
 impl Parser {
@@ -97,6 +146,7 @@ impl Parser {
         Self {
             limits: Limits::new(),
             duplicates: DuplicateKeys::Error,
+            numbers: Numbers::IntegerText,
         }
     }
 
@@ -129,6 +179,33 @@ impl Parser {
     pub const fn duplicate_keys(mut self, policy: DuplicateKeys) -> Self {
         self.duplicates = policy;
         self
+    }
+
+    /// Sets how typed reads take integers; see [`Numbers`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Numbers, Parser};
+    ///
+    /// let p = Parser::new().numbers(Numbers::WholeValues);
+    /// assert_eq!(p.get_numbers(), Numbers::WholeValues);
+    /// ```
+    pub const fn numbers(mut self, numbers: Numbers) -> Self {
+        self.numbers = numbers;
+        self
+    }
+
+    /// The parser's [`Numbers`] setting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(jsonx_lib::Parser::new().get_numbers(), jsonx_lib::Numbers::IntegerText);
+    /// ```
+    #[must_use]
+    pub const fn get_numbers(&self) -> Numbers {
+        self.numbers
     }
 
     /// The parser's budgets.
@@ -186,7 +263,7 @@ impl Parser {
         let value = reader
             .read_value()?
             .ok_or(Error::new(ErrorKind::UnexpectedEnd, text.len()))?;
-        reader.finish()?;
+        reader.read_to_end()?;
         Ok(value)
     }
 
@@ -228,7 +305,7 @@ impl Parser {
     /// ```
     #[must_use]
     pub fn reader<'a>(&self, text: &'a str) -> Reader<'a> {
-        Reader::with_config(text, self.limits, self.duplicates)
+        Reader::with_config(text, self.limits, self.duplicates).with_numbers(self.numbers)
     }
 
     /// A [`Reader`] over bytes, which must be UTF-8. The size budget and the
@@ -263,11 +340,51 @@ impl Parser {
 }
 
 /// An open container in the builder: where its children start on the shared
-/// value and key stacks.
+/// value and key stacks, and where it starts in the input.
 #[derive(Clone, Copy)]
 struct Frame {
     values: usize,
     keys: usize,
+    start: usize,
+}
+
+/// The heap a build holds, against [`Limits::max_memory`].
+struct Budget {
+    max: usize,
+    /// The finished arrays and objects, and decoded strings.
+    held: usize,
+}
+
+impl Budget {
+    /// Refuses the value at `at` if `extra` more bytes, on top of what is
+    /// held and the stacks' `stacks` bytes, would pass the budget.
+    #[inline]
+    fn allow(&self, stacks: usize, extra: usize, at: usize) -> Result<(), Error> {
+        if self.held.saturating_add(stacks).saturating_add(extra) > self.max {
+            Err(Error::new(ErrorKind::MemoryLimitExceeded, at))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The bytes the builder's stacks hold, at their capacity.
+#[inline]
+fn stacks(values: &Vec<Value<'_>>, keys: &Vec<Cow<'_, str>>) -> usize {
+    values.capacity() * size_of::<Value<'_>>() + keys.capacity() * size_of::<Cow<'_, str>>()
+}
+
+/// The bytes one more push onto `v` would allocate: none while it has room,
+/// otherwise its whole new buffer (vectors double, from four). The old
+/// buffer is still counted in [`stacks`] until the move, so the check covers
+/// the moment both exist.
+#[inline]
+fn growth<T>(v: &Vec<T>) -> usize {
+    if v.len() < v.capacity() {
+        0
+    } else {
+        (v.capacity() * 2).max(4) * size_of::<T>()
+    }
 }
 
 /// Buffers reused by every object's duplicate check in one build.
@@ -281,188 +398,155 @@ struct Scratch {
 ///
 /// Children of every open container sit on one shared value stack; when a
 /// container closes, its children are moved off the top into a vector of
-/// exactly their size. Nothing recurses, and no container's vector ever grows
-/// by reallocation.
+/// exactly their size, except the outermost array, which takes the stack
+/// itself. Nothing recurses, and no container's vector other than that
+/// outermost one (the value stack, which grows by doubling) ever grows by
+/// reallocation. What the build holds is charged against `max_memory`
+/// before it is allocated (see [`Limits`]).
 pub(crate) fn build<'a>(
     reader: &mut Reader<'a>,
     policy: DuplicateKeys,
 ) -> Result<Value<'a>, Error> {
     let mut values: Vec<Value<'a>> = Vec::new();
-    let mut keys: Vec<(Cow<'a, str>, usize)> = Vec::new();
-    let mut frames: Vec<Frame> = Vec::new();
+    let mut keys: Vec<Cow<'a, str>> = Vec::new();
+    // The open containers: a message's few levels live inline.
+    let mut frames: SmallStack<Frame, 16> = SmallStack::new(Frame {
+        values: 0,
+        keys: 0,
+        start: 0,
+    });
     let mut scratch = Scratch::default();
+    // The document's count so far: a tree built inside a typed read adds
+    // to what that read already holds.
+    let mut budget = Budget {
+        max: reader.max_memory(),
+        held: reader.held(),
+    };
     loop {
         let Some(event) = reader.next_event()? else {
             // The reader ends a document only after a complete value.
             return Err(Error::new(ErrorKind::UnexpectedEnd, reader.offset()));
         };
+        let at = reader.event_offset();
         let value = match event {
             Event::StartArray | Event::StartObject => {
                 frames.push(Frame {
                     values: values.len(),
                     keys: keys.len(),
+                    start: at,
                 });
                 continue;
             }
             Event::Key(key) => {
-                keys.push((key, reader.event_offset()));
+                budget.allow(stacks(&values, &keys), growth(&keys), at)?;
+                if let Cow::Owned(decoded) = &key {
+                    budget.held += decoded.capacity();
+                }
+                keys.push(key);
                 continue;
             }
             Event::EndArray => {
                 let Some(frame) = frames.pop() else {
-                    return Err(Error::new(ErrorKind::ExpectedValue, reader.event_offset()));
+                    return Err(Error::new(ErrorKind::ExpectedValue, at));
                 };
+                if frames.len() == 0 && frame.values == 0 {
+                    // The outermost array: its items are the whole stack,
+                    // which becomes the array in place, already counted.
+                    let mut items = core::mem::take(&mut values);
+                    items.shrink_to_fit();
+                    reader.set_held(budget.held + items.capacity() * size_of::<Value<'a>>());
+                    return Ok(Value::Array(Array::from(items)));
+                }
+                let bytes = (values.len() - frame.values) * size_of::<Value<'a>>();
+                budget.allow(stacks(&values, &keys), bytes, frame.start)?;
+                budget.held += bytes;
                 Value::Array(Array::from(values.split_off(frame.values)))
             }
             Event::EndObject => {
                 let Some(frame) = frames.pop() else {
-                    return Err(Error::new(ErrorKind::ExpectedValue, reader.event_offset()));
+                    return Err(Error::new(ErrorKind::ExpectedValue, at));
                 };
+                let bytes = (keys.len() - frame.keys) * size_of::<Member<'a>>();
+                budget.allow(stacks(&values, &keys), bytes, frame.start)?;
+                budget.held += bytes;
                 Value::Object(close_object(
                     &mut values,
                     &mut keys,
                     frame,
                     policy,
                     &mut scratch,
-                )?)
+                ))
             }
-            Event::String(s) => Value::String(s),
+            Event::String(s) => {
+                if let Cow::Owned(decoded) = &s {
+                    budget.held += decoded.capacity();
+                    budget.allow(stacks(&values, &keys), 0, at)?;
+                }
+                Value::String(s)
+            }
             Event::Number(n) => Value::Number(n),
             Event::Bool(b) => Value::Bool(b),
             Event::Null => Value::Null,
         };
-        if frames.is_empty() {
+        if frames.len() == 0 {
+            reader.set_held(budget.held);
             return Ok(value);
         }
+        let start = match &value {
+            Value::Array(_) | Value::Object(_) => reader.event_offset(),
+            _ => at,
+        };
+        budget.allow(stacks(&values, &keys), growth(&values), start)?;
         values.push(value);
     }
 }
 
 #[inline]
-fn key_at<'k>(keys: &'k [(Cow<'_, str>, usize)], i: usize) -> &'k str {
-    keys.get(i).map_or("", |(k, _)| k)
+fn key_at<'k>(keys: &'k [Cow<'_, str>], i: usize) -> &'k str {
+    keys.get(i).map_or("", |k| k)
 }
 
 /// Moves the closing object's members off the stacks, applying `policy`.
+/// Under [`DuplicateKeys::Error`] the reader has already refused any
+/// duplicate (when the object closed), so only `First` and `Last` have
+/// anything to do here.
 fn close_object<'a>(
     values: &mut Vec<Value<'a>>,
-    keys: &mut Vec<(Cow<'a, str>, usize)>,
+    keys: &mut Vec<Cow<'a, str>>,
     frame: Frame,
     policy: DuplicateKeys,
     scratch: &mut Scratch,
-) -> Result<Object<'a>, Error> {
+) -> Object<'a> {
     let member_keys = keys.get(frame.keys..).unwrap_or(&[]);
-    let mut dedupe = false;
-    if policy != DuplicateKeys::KeepAll && has_duplicates(member_keys, &mut scratch.order) {
-        match policy {
-            DuplicateKeys::First | DuplicateKeys::Last => {
-                mark_duplicates(member_keys, policy, scratch, values, frame.values);
-                dedupe = true;
-            }
-            _ => {
-                let at = first_repeat(member_keys, &scratch.order);
-                let offset = member_keys.get(at).map_or(0, |(_, o)| *o);
-                return Err(Error::new(ErrorKind::DuplicateKey, offset));
-            }
-        }
+    let key = |i| key_at(member_keys, i);
+    let dedupe = matches!(policy, DuplicateKeys::First | DuplicateKeys::Last)
+        && dupes::has_duplicates(member_keys.len(), &key, &mut scratch.order);
+    if dedupe {
+        mark_duplicates(member_keys, policy, scratch, values, frame.values);
     }
-    let pairs = keys
-        .drain(frame.keys..)
-        .map(|(k, _)| k)
-        .zip(values.drain(frame.values..));
+    let pairs = keys.drain(frame.keys..).zip(values.drain(frame.values..));
     let members: Vec<Member<'a>> = if dedupe {
-        pairs
-            .zip(scratch.keep.iter())
-            .filter_map(|(member, &keep)| keep.then_some(member))
-            .collect()
+        // Sized exactly up front: a filtered iterator's size is unknown, and
+        // collecting it would grow the vector by reallocation.
+        let kept = scratch.keep.iter().filter(|&&keep| keep).count();
+        let mut members = Vec::with_capacity(kept);
+        members.extend(
+            pairs
+                .zip(scratch.keep.iter())
+                .filter_map(|(member, &keep)| keep.then_some(member)),
+        );
+        members
     } else {
         pairs.collect()
     };
-    Ok(Object::from(members))
-}
-
-/// Whether any key repeats. Small objects are checked pairwise; larger ones
-/// by sorting indices (`O(n log n)`), which also leaves `order` sorted by
-/// (key, position) for [`first_repeat`] and [`mark_duplicates`].
-fn has_duplicates(keys: &[(Cow<'_, str>, usize)], order: &mut Vec<usize>) -> bool {
-    const PAIRWISE: usize = 16;
-    let n = keys.len();
-    if n < 2 {
-        return false;
-    }
-    if n <= PAIRWISE {
-        // At most 120 one-word comparisons; the strings themselves are
-        // compared only when their fingerprints match.
-        let mut prints = [0u64; PAIRWISE];
-        for (slot, (key, _)) in prints.iter_mut().zip(keys) {
-            *slot = fingerprint(key);
-        }
-        let prints = prints.get(..n).unwrap_or(&[]);
-        let any = prints.iter().enumerate().skip(1).any(|(i, a)| {
-            prints
-                .iter()
-                .take(i)
-                .enumerate()
-                .any(|(j, b)| a == b && key_at(keys, i) == key_at(keys, j))
-        });
-        if !any {
-            return false;
-        }
-    }
-    order.clear();
-    order.extend(0..n);
-    order.sort_unstable_by(|&a, &b| key_at(keys, a).cmp(key_at(keys, b)).then(a.cmp(&b)));
-    order.windows(2).any(|w| match w {
-        [a, b] => key_at(keys, *a) == key_at(keys, *b),
-        _ => false,
-    })
-}
-
-/// A cheap summary of a key: equal keys have equal fingerprints. The length
-/// and the first eight bytes, which tell most distinct keys apart.
-#[inline]
-fn fingerprint(key: &str) -> u64 {
-    let bytes = key.as_bytes();
-    let mut head = [0u8; 8];
-    for (slot, &b) in head.iter_mut().zip(bytes) {
-        *slot = b;
-    }
-    u64::from_le_bytes(head) ^ (bytes.len() as u64).rotate_left(56)
-}
-
-/// Calls `f(run)` for each run of equal keys in `order` (each run sorted by
-/// position, the first being the first occurrence).
-fn for_each_run(keys: &[(Cow<'_, str>, usize)], order: &[usize], mut f: impl FnMut(&[usize])) {
-    let mut start = 0;
-    while start < order.len() {
-        let first = key_at(keys, order.get(start).copied().unwrap_or(0));
-        let mut end = start + 1;
-        while order.get(end).is_some_and(|&i| key_at(keys, i) == first) {
-            end += 1;
-        }
-        if end - start > 1 {
-            f(order.get(start..end).unwrap_or(&[]));
-        }
-        start = end;
-    }
-}
-
-/// The position of the earliest member whose key repeats an earlier one.
-fn first_repeat(keys: &[(Cow<'_, str>, usize)], order: &[usize]) -> usize {
-    let mut earliest = usize::MAX;
-    for_each_run(keys, order, |run| {
-        if let Some(&second) = run.get(1) {
-            earliest = earliest.min(second);
-        }
-    });
-    earliest
+    Object::from(members)
 }
 
 /// Fills `scratch.keep` with which members survive the policy, and for
 /// [`DuplicateKeys::Last`] moves each repeated key's last value to its first
-/// position.
+/// position. `scratch.order` holds the keys' sorted order.
 fn mark_duplicates(
-    keys: &[(Cow<'_, str>, usize)],
+    keys: &[Cow<'_, str>],
     policy: DuplicateKeys,
     scratch: &mut Scratch,
     values: &mut [Value<'_>],
@@ -471,7 +555,8 @@ fn mark_duplicates(
     let keep = &mut scratch.keep;
     keep.clear();
     keep.resize(keys.len(), true);
-    for_each_run(keys, &scratch.order, |run| {
+    let key = |i| key_at(keys, i);
+    dupes::for_each_run(&key, &scratch.order, |run| {
         let (Some(&first), Some(&last)) = (run.first(), run.last()) else {
             return;
         };

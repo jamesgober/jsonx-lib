@@ -28,22 +28,61 @@ const fn err<T>(kind: ErrorKind, offset: usize) -> Result<T, Error> {
     Err(Error::new(kind, offset))
 }
 
+/// Where a string scan stopped, so it can continue when more input arrives:
+/// every byte before `next` has been checked, and `next` is not inside an
+/// escape sequence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StrScan {
+    /// The first byte not yet checked.
+    pub(crate) next: usize,
+    /// Whether an escape sequence was seen before `next`.
+    pub(crate) escaped: bool,
+}
+
+impl StrScan {
+    /// A scan of the string whose opening quote is at `quote`, from its
+    /// first body byte.
+    #[inline]
+    pub(crate) const fn start(quote: usize) -> Self {
+        Self {
+            next: quote + 1,
+            escaped: false,
+        }
+    }
+}
+
 /// Scans the string whose opening quote is at `quote`, validating every escape
 /// and refusing a body longer than `max` source bytes.
 ///
 /// Nothing is decoded or allocated here: a string with escapes is validated in
 /// this pass and decoded by [`decode`] in a second, so the decoder can size its
 /// buffer exactly, and only after the length budget has passed.
+#[inline]
 pub(crate) fn scan_string(bytes: &[u8], quote: usize, max: usize) -> Result<StrToken, Error> {
+    resume_string(bytes, quote, &mut StrScan::start(quote), max)
+}
+
+/// [`scan_string`] from where `scan` stopped. When the input runs out
+/// ([`ErrorKind::UnexpectedEnd`]), `scan` records how far the string was
+/// checked, so a later call over a longer input picks up there: a string fed
+/// in pieces is scanned once, plus at most the eleven bytes of an escape cut
+/// in half.
+#[inline(always)]
+pub(crate) fn resume_string(
+    bytes: &[u8],
+    quote: usize,
+    scan: &mut StrScan,
+    max: usize,
+) -> Result<StrToken, Error> {
     let len = bytes.len();
     let body = quote + 1;
     // The closing quote may sit at `body + max` at the latest; nothing past
     // that needs looking at before the budget refuses the string.
     let cap = body.saturating_add(max).saturating_add(1).min(len);
-    let mut i = body;
-    let mut escaped = false;
+    let mut i = scan.next;
     loop {
         i = scan::find_read_special(bytes, i, cap);
+        scan.next = i;
         let byte = if i < cap { bytes.get(i).copied() } else { None };
         let Some(b) = byte else {
             return if i - body > max {
@@ -56,12 +95,13 @@ pub(crate) fn scan_string(bytes: &[u8], quote: usize, max: usize) -> Result<StrT
             b'"' => {
                 return Ok(StrToken {
                     end: i + 1,
-                    escaped,
+                    escaped: scan.escaped,
                 });
             }
             b'\\' => {
-                escaped = true;
                 i = scan_escape(bytes, i)?;
+                scan.next = i;
+                scan.escaped = true;
                 if i - body > max {
                     return err(ErrorKind::StringTooLong, quote);
                 }
@@ -197,61 +237,158 @@ pub(crate) fn decode(body: &str) -> String {
     }
 }
 
+/// Where a number scan stopped: the first byte not yet looked at, and the
+/// grammar state reached before it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NumScan {
+    /// The first byte not yet checked.
+    next: usize,
+    state: NumState,
+}
+
+impl NumScan {
+    /// A scan of the number whose first byte is at `start`.
+    #[inline]
+    pub(crate) const fn start(start: usize) -> Self {
+        Self {
+            next: start,
+            state: NumState::Start,
+        }
+    }
+
+    /// Moves the scan's position `by` bytes towards the start of the input.
+    #[inline]
+    pub(crate) const fn rebase(&mut self, by: usize) {
+        self.next -= by;
+    }
+}
+
+/// The states of the RFC 8259 number grammar,
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumState {
+    /// Nothing read yet.
+    Start,
+    /// After `-`: a digit must follow.
+    Minus,
+    /// A leading `0`: a whole number, but no digit may follow it.
+    Zero,
+    /// In the integer digits.
+    Int,
+    /// After `.`: a digit must follow.
+    Dot,
+    /// In the fraction digits.
+    Frac,
+    /// After `e` or `E`: a sign or a digit must follow.
+    Exp,
+    /// After the exponent's sign: a digit must follow.
+    ExpSign,
+    /// In the exponent digits.
+    ExpDigits,
+}
+
+impl NumState {
+    /// Whether the text so far is a whole number.
+    #[inline]
+    const fn is_complete(self) -> bool {
+        matches!(self, Self::Zero | Self::Int | Self::Frac | Self::ExpDigits)
+    }
+}
+
 /// Scans the number starting at `start` (a `-` or a digit) and returns the
 /// offset just past it. A number longer than `max` bytes is refused as
 /// [`ErrorKind::NumberTooLong`] at `start`, whatever follows it.
+#[cfg(test)]
 pub(crate) fn scan_number(bytes: &[u8], start: usize, max: usize) -> Result<usize, Error> {
-    match scan_number_text(bytes, start) {
+    resume_number(bytes, start, &mut NumScan::start(start), true, max)
+}
+
+/// [`scan_number`] from where `scan` stopped. With `complete`, the end of
+/// `bytes` is the end of the input, so a number that reaches it ends there.
+/// Without it, a number that reaches the end may still go on: the scan stops
+/// with [`ErrorKind::UnexpectedEnd`] and `scan` set to continue, so a number
+/// fed in pieces is scanned once.
+pub(crate) fn resume_number(
+    bytes: &[u8],
+    start: usize,
+    scan: &mut NumScan,
+    complete: bool,
+    max: usize,
+) -> Result<usize, Error> {
+    match number_text(bytes, scan, complete) {
         Ok(end) if end - start > max => err(ErrorKind::NumberTooLong, start),
         Err(e) if e.offset() - start > max => err(ErrorKind::NumberTooLong, start),
         other => other,
     }
 }
 
-/// The RFC 8259 number grammar:
-/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
-fn scan_number_text(bytes: &[u8], start: usize) -> Result<usize, Error> {
-    let len = bytes.len();
-    let digits_from = |mut i: usize| {
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        i
-    };
-    // One digit is required here; returns the offset past the run.
-    let required_digits = |i: usize| match bytes.get(i) {
-        None => err(ErrorKind::UnexpectedEnd, len),
-        Some(b) if b.is_ascii_digit() => Ok(digits_from(i + 1)),
-        Some(_) => err(ErrorKind::InvalidNumber, i),
-    };
-
+/// The end of the integer starting at `start` (`-?(0|[1-9][0-9]*)`), when
+/// the byte after it ends the number: the common case, decided without the
+/// grammar's state machine. `None` for anything else (a fraction, an
+/// exponent, a leading zero followed by a digit, the end of the text, or no
+/// number at all), which [`resume_number`] then reads, with its errors.
+#[inline(always)]
+pub(crate) fn quick_integer(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     if bytes.get(i) == Some(&b'-') {
         i += 1;
     }
-    i = match bytes.get(i) {
-        None => return err(ErrorKind::UnexpectedEnd, len),
-        Some(b'0') => {
-            // A leading zero stands alone: `01` and `-00` are not numbers.
-            if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                return err(ErrorKind::InvalidNumber, i + 1);
-            }
-            i + 1
-        }
-        Some(b'1'..=b'9') => digits_from(i + 1),
-        Some(_) => return err(ErrorKind::InvalidNumber, i),
-    };
-    if bytes.get(i) == Some(&b'.') {
-        i = required_digits(i + 1)?;
-    }
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+    match bytes.get(i)? {
+        b'0' => i += 1,
+        b'1'..=b'9' => {
             i += 1;
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
         }
-        i = required_digits(i)?;
+        _ => return None,
     }
-    Ok(i)
+    match bytes.get(i)? {
+        b'.' | b'e' | b'E' | b'0'..=b'9' => None,
+        _ => Some(i),
+    }
+}
+
+/// The number grammar as a resumable state machine; see [`NumState`].
+fn number_text(bytes: &[u8], scan: &mut NumScan, complete: bool) -> Result<usize, Error> {
+    let mut i = scan.next;
+    let mut state = scan.state;
+    loop {
+        let Some(&b) = bytes.get(i) else {
+            scan.next = i;
+            scan.state = state;
+            return if complete && state.is_complete() {
+                Ok(i)
+            } else {
+                err(ErrorKind::UnexpectedEnd, bytes.len())
+            };
+        };
+        state = match (state, b) {
+            (NumState::Start, b'-') => NumState::Minus,
+            (NumState::Start | NumState::Minus, b'0') => NumState::Zero,
+            (NumState::Start | NumState::Minus, b'1'..=b'9') => NumState::Int,
+            // A leading zero stands alone: `01` and `-00` are not numbers.
+            (NumState::Zero, b'0'..=b'9') => return err(ErrorKind::InvalidNumber, i),
+            (NumState::Int | NumState::Frac | NumState::ExpDigits, b'0'..=b'9') => {
+                // The common case: a run of digits.
+                i += 1;
+                while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                continue;
+            }
+            (NumState::Zero | NumState::Int, b'.') => NumState::Dot,
+            (NumState::Dot, b'0'..=b'9') => NumState::Frac,
+            (NumState::Zero | NumState::Int | NumState::Frac, b'e' | b'E') => NumState::Exp,
+            (NumState::Exp, b'+' | b'-') => NumState::ExpSign,
+            (NumState::Exp | NumState::ExpSign, b'0'..=b'9') => NumState::ExpDigits,
+            // The number stops where the grammar does; the caller judges
+            // what follows.
+            (complete_so_far, _) if complete_so_far.is_complete() => return Ok(i),
+            _ => return err(ErrorKind::InvalidNumber, i),
+        };
+        i += 1;
+    }
 }
 
 /// Matches the rest of the literal `word` (`true`, `false`, or `null`), whose
@@ -271,7 +408,7 @@ pub(crate) fn scan_literal(bytes: &[u8], at: usize, word: &[u8]) -> Result<usize
 pub(crate) fn is_number(text: &str) -> bool {
     let bytes = text.as_bytes();
     matches!(bytes.first(), Some(b'-' | b'0'..=b'9'))
-        && scan_number_text(bytes, 0).is_ok_and(|end| end == bytes.len())
+        && number_text(bytes, &mut NumScan::start(0), true).is_ok_and(|end| end == bytes.len())
 }
 
 #[cfg(test)]
@@ -285,6 +422,42 @@ mod tests {
     fn kind_at(r: Result<impl core::fmt::Debug, Error>) -> (ErrorKind, usize) {
         let e = r.err().map(|e| (e.kind(), e.offset()));
         e.unwrap_or((ErrorKind::UnexpectedEnd, usize::MAX))
+    }
+
+    #[test]
+    fn test_quick_integer_agrees_with_the_grammar_where_it_answers() {
+        let cases = [
+            "0,",
+            "-0]",
+            "7 ",
+            "42}",
+            "-12345678901234567890,",
+            "01,",
+            "-01 ",
+            "1.5,",
+            "1e3 ",
+            "2E1]",
+            "-,",
+            "- 1",
+            "0",
+            "123",
+            "-",
+            "x",
+            "9.",
+            "0x1,",
+            "00",
+        ];
+        for case in cases {
+            let bytes = case.as_bytes();
+            if let Some(end) = quick_integer(bytes, 0) {
+                assert_eq!(scan_number(bytes, 0, usize::MAX).ok(), Some(end), "{case}");
+            }
+        }
+        assert_eq!(quick_integer(b"42,", 0), Some(2));
+        assert_eq!(quick_integer(b"[-7]", 1), Some(3));
+        assert_eq!(quick_integer(b"42", 0), None); // the end of the text decides
+        assert_eq!(quick_integer(b"01,", 0), None);
+        assert_eq!(quick_integer(b"1.5,", 0), None);
     }
 
     #[test]
@@ -417,6 +590,84 @@ mod tests {
             kind_at(scan_literal(b"nul", 0, b"null")),
             (ErrorKind::UnexpectedEnd, 3)
         );
+    }
+
+    #[test]
+    fn test_resume_string_at_every_split_matches_one_scan() {
+        let src = br#""ab\n\u00e9\ud83d\ude00cd" tail"#;
+        let whole = scan_string(src, 0, usize::MAX)
+            .ok()
+            .map(|t| (t.end, t.escaped));
+        assert_eq!(whole, Some((26, true)));
+        for cut in 1..src.len() {
+            let mut scan = StrScan::start(0);
+            let head = src.get(..cut).unwrap_or_default();
+            match resume_string(head, 0, &mut scan, usize::MAX) {
+                Ok(t) => assert_eq!(Some((t.end, t.escaped)), whole),
+                Err(e) => {
+                    assert_eq!((e.kind(), e.offset()), (ErrorKind::UnexpectedEnd, cut));
+                    // The scan never stops inside an escape, and never past the cut.
+                    assert!(scan.next <= cut);
+                    assert_ne!(src.get(scan.next.saturating_sub(1)), Some(&b'\\'));
+                    let rest = resume_string(src, 0, &mut scan, usize::MAX);
+                    assert_eq!(rest.ok().map(|t| (t.end, t.escaped)), whole, "cut {cut}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resume_string_keeps_budget_and_errors() {
+        let mut scan = StrScan::start(0);
+        assert!(resume_string(b"\"abc", 0, &mut scan, 3).is_err());
+        assert_eq!(
+            kind_at(resume_string(b"\"abcd\"", 0, &mut scan, 3)),
+            (ErrorKind::StringTooLong, 0)
+        );
+        let mut scan = StrScan::start(0);
+        assert!(resume_string(b"\"a\\", 0, &mut scan, 9).is_err());
+        assert_eq!(
+            kind_at(resume_string(b"\"a\\q\"", 0, &mut scan, 9)),
+            (ErrorKind::InvalidEscape, 3)
+        );
+    }
+
+    #[test]
+    fn test_resume_number_at_every_split_matches_one_scan() {
+        for text in ["-12.5e+30,", "0,", "-0.0e0]", "7 ", "123456789}", "1E-2,"] {
+            let src = text.as_bytes();
+            let whole = scan_number(src, 0, usize::MAX).ok();
+            for cut in 1..src.len() {
+                let mut scan = NumScan::start(0);
+                let head = src.get(..cut).unwrap_or_default();
+                match resume_number(head, 0, &mut scan, false, usize::MAX) {
+                    Ok(end) => assert_eq!(Some(end), whole, "{text} cut {cut}"),
+                    Err(e) => {
+                        assert_eq!((e.kind(), e.offset()), (ErrorKind::UnexpectedEnd, cut));
+                        let rest = resume_number(src, 0, &mut scan, false, usize::MAX);
+                        assert_eq!(rest.ok(), whole, "{text} cut {cut}");
+                    }
+                }
+            }
+            // Complete input: a number at the very end ends there.
+            let bare = src.get(..src.len() - 1).unwrap_or_default();
+            assert_eq!(scan_number(bare, 0, usize::MAX).ok(), whole);
+        }
+        // Partial input: an invalid byte is still refused at once.
+        let mut scan = NumScan::start(0);
+        assert_eq!(
+            kind_at(resume_number(b"01", 0, &mut scan, false, 9)),
+            (ErrorKind::InvalidNumber, 1)
+        );
+        // And the budget is enforced on the part seen so far.
+        let mut scan = NumScan::start(0);
+        assert_eq!(
+            kind_at(resume_number(b"1234", 0, &mut scan, false, 3)),
+            (ErrorKind::NumberTooLong, 0)
+        );
+        let mut scan = NumScan::start(4);
+        scan.rebase(4);
+        assert_eq!(resume_number(b"5 ", 0, &mut scan, false, 3).ok(), Some(1));
     }
 
     #[test]

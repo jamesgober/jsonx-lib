@@ -4,146 +4,21 @@
 
 mod common;
 
-use common::{Fail, RefValue, to_ref};
-use jsonx_lib::{DuplicateKeys, ErrorKind, Event, Limits, Number, Parser, Value};
+use common::{
+    Fail, RefValue,
+    strategies::{mutated, soup, tricky_string, value},
+    to_ref,
+};
+use jsonx_lib::{
+    DuplicateKeys, ErrorKind, Event, Format, Limits, Parser, ToJson, Value, ValueWriter, Writer,
+    Written,
+};
 use proptest::{prelude::*, sample::Index};
 
 /// No budgets and no duplicate check: the grammar alone decides.
 const GRAMMAR_ONLY: Parser = Parser::new()
     .limits(Limits::unlimited())
     .duplicate_keys(DuplicateKeys::KeepAll);
-
-// ---- Generators ----------------------------------------------------------------
-
-/// Any JSON number text, including ones too large or precise for any machine type.
-fn number_text() -> impl Strategy<Value = String> {
-    "-?(0|[1-9][0-9]{0,30})(\\.[0-9]{1,20})?([eE][+-]?[0-9]{1,5})?"
-}
-
-/// Strings rich in the characters escaping must handle.
-fn tricky_string() -> impl Strategy<Value = String> {
-    let ch = prop_oneof![
-        3 => any::<char>(),
-        1 => prop::sample::select(vec![
-            '"', '\\', '/', '\u{0}', '\u{1}', '\u{8}', '\u{c}', '\n', '\r', '\t', '\u{1f}',
-            '\u{7f}', '\u{2028}', '\u{2029}', '\u{2027}', '\u{20ac}', '\u{1f600}', 'u', 'a',
-        ]),
-    ];
-    prop_oneof![
-        prop::collection::vec(ch, 0..24).prop_map(String::from_iter),
-        any::<String>(),
-    ]
-}
-
-fn leaf() -> impl Strategy<Value = Value<'static>> {
-    prop_oneof![
-        Just(Value::Null),
-        any::<bool>().prop_map(Value::from),
-        any::<i64>().prop_map(Value::from),
-        any::<u64>().prop_map(Value::from),
-        any::<f64>().prop_map(Value::from),
-        number_text().prop_map(|t| {
-            Number::from_text(&t).map_or(Value::Null, |n| Value::Number(n.into_owned()))
-        }),
-        tricky_string().prop_map(Value::from),
-    ]
-}
-
-/// Arbitrary documents. Object keys may repeat.
-fn value() -> impl Strategy<Value = Value<'static>> {
-    leaf().prop_recursive(6, 96, 8, |inner| {
-        prop_oneof![
-            prop::collection::vec(inner.clone(), 0..8).prop_map(Value::from),
-            prop::collection::vec((tricky_string(), inner), 0..8)
-                .prop_map(|members| Value::Object(members.into_iter().collect())),
-        ]
-    })
-}
-
-/// Pieces that, glued at random, land near every grammar boundary.
-const FRAGMENTS: &[&str] = &[
-    "{",
-    "}",
-    "[",
-    "]",
-    ",",
-    ":",
-    "\"",
-    "\\",
-    "\"a\"",
-    "\"k\":",
-    "\"\\u00e9\"",
-    "\"\\ud83d\\ude00\"",
-    "\\ud800",
-    "\\udc00",
-    "\\u",
-    "u",
-    "0",
-    "1",
-    "9",
-    "-",
-    ".",
-    "e",
-    "E",
-    "+",
-    "true",
-    "tru",
-    "false",
-    "null",
-    "nul",
-    " ",
-    "\n",
-    "\t",
-    "\r",
-    "\u{1}",
-    "\u{e9}",
-    "\u{2028}",
-    "\u{feff}",
-    "x",
-    "/",
-    "b",
-    "n",
-    "12",
-    "0.5",
-    "1e3",
-    "\\n",
-    "\\\"",
-    "D800",
-    "DC00",
-    "dc00",
-    "00",
-];
-
-fn soup() -> impl Strategy<Value = String> {
-    prop::collection::vec(prop::sample::select(FRAGMENTS), 0..24).prop_map(|parts| parts.concat())
-}
-
-/// A valid document with one random edit at a character boundary.
-fn mutated() -> impl Strategy<Value = String> {
-    (
-        value(),
-        any::<Index>(),
-        prop::sample::select(FRAGMENTS),
-        0..3u8,
-    )
-        .prop_map(|(v, at, fragment, edit)| {
-            let text = jsonx_lib::to_string(&v);
-            let bounds: Vec<usize> = (0..=text.len())
-                .filter(|&i| text.is_char_boundary(i))
-                .collect();
-            let i = bounds.get(at.index(bounds.len())).copied().unwrap_or(0);
-            let (head, tail) = text.split_at(i);
-            match edit {
-                0 => format!("{head}{fragment}{tail}"),
-                1 => {
-                    let mut chars = tail.chars();
-                    let _removed = chars.next();
-                    format!("{head}{}", chars.as_str())
-                }
-                _ => head.to_owned(),
-            }
-        })
-}
 
 // ---- The agreement check ----------------------------------------------------------
 
@@ -297,6 +172,148 @@ proptest! {
         prop_assert!(reader.finish().is_ok());
     }
 
+    /// Typed output (`ToJson`) nests a `Value` in the same layout as a `Value`
+    /// built around it, compact and pretty, and every output path agrees.
+    #[test]
+    fn prop_typed_output_matches_value_output(v in value(), items in prop::collection::vec(value(), 0..4)) {
+        struct Holder<'a> { v: &'a Value<'a>, items: &'a [Value<'static>] }
+        impl ToJson for Holder<'_> {
+            fn to_json(&self, out: ValueWriter<'_>) -> Written {
+                out.object(|o| {
+                    o.member("v", self.v);
+                    o.member_with("items", |w| w.array(|a| a.items(self.items)));
+                    o.member("n", &[1u8, 2]);
+                })
+            }
+        }
+        let holder = Holder { v: &v, items: &items };
+        let mut built = jsonx_lib::Object::new();
+        built.push("v", v.clone());
+        built.push("items", Value::from(items.clone()));
+        built.push("n", jsonx_lib::json!([1, 2]));
+        let built = Value::Object(built);
+        prop_assert_eq!(jsonx_lib::to_string(&holder), jsonx_lib::to_string(&built));
+        prop_assert_eq!(jsonx_lib::to_string_pretty(&holder), jsonx_lib::to_string_pretty(&built));
+        #[cfg(feature = "std")]
+        {
+            let mut io = Vec::new();
+            prop_assert!(jsonx_lib::to_writer_pretty(&mut io, &holder).is_ok());
+            prop_assert_eq!(io, jsonx_lib::to_string_pretty(&built).into_bytes());
+        }
+    }
+
+    /// Every format writes text that reads back as the same value, under
+    /// both parsers, with the byte property it promises.
+    #[test]
+    fn prop_every_format_round_trips(v in value(), indent in 0u8..9, pretty in any::<bool>(), ascii in any::<bool>(), html in any::<bool>()) {
+        let base = if pretty { Format::compact().with_indent(indent) } else { Format::compact() };
+        let format = base.ascii(ascii).html_safe(html);
+        let text = jsonx_lib::to_string_with(&v, format);
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&text).ok(), Some(v.clone()));
+        prop_assert_eq!(common::parse(text.as_bytes()).result.ok(), Some(to_ref(&v)));
+        if ascii {
+            prop_assert!(text.is_ascii());
+        }
+        if html {
+            prop_assert!(!text.contains(['<', '>', '&']));
+        }
+        // The default formats are the 0.2 layouts.
+        prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::compact()), jsonx_lib::to_string(&v));
+        prop_assert_eq!(jsonx_lib::to_string_with(&v, Format::pretty()), jsonx_lib::to_string_pretty(&v));
+    }
+
+    /// Raw text obeys the strict formats too: forwarded verbatim in the
+    /// plain ones, with `<`, `>`, `&`, and non-ASCII escaped in its strings
+    /// under HTML-safe and ASCII-only, and the same value either way.
+    #[test]
+    fn prop_raw_values_obey_every_format(v in value(), s in tricky_string(), pretty in any::<bool>(), ascii in any::<bool>(), html in any::<bool>()) {
+        let base = if pretty { Format::pretty() } else { Format::compact() };
+        let format = base.ascii(ascii).html_safe(html);
+        let doc = jsonx_lib::json!({ "s": s.as_str(), "v": v.clone(), "tag": "</script>&<b>caf\u{e9}\u{2028}" });
+        let raw = jsonx_lib::RawValue::encode(&doc);
+        let text = jsonx_lib::to_string_with(&raw, format);
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&text).ok(), Some(doc.clone()));
+        if ascii {
+            prop_assert!(text.is_ascii());
+        }
+        if html {
+            prop_assert!(!text.contains(['<', '>', '&']));
+        }
+        if !ascii && !html {
+            prop_assert_eq!(text.as_str(), raw.as_str());
+        }
+        // The push writer writes raw values the same way.
+        let mut out = String::new();
+        let mut w = Writer::new(&mut out).with_format(format);
+        w.begin_array().unwrap();
+        w.value(&raw).unwrap();
+        w.end_array().unwrap();
+        w.finish().unwrap();
+        prop_assert_eq!(GRAMMAR_ONLY.parse(&out).ok(), Some(Value::Array(vec![doc].into())));
+        if html {
+            prop_assert!(!out.contains(['<', '>', '&']));
+        }
+    }
+
+    /// The push writer, fed a reader's events, writes what the value writers
+    /// write, in every layout.
+    #[test]
+    fn prop_events_through_the_writer_match_the_value_writer(v in value(), pretty in any::<bool>()) {
+        let format = if pretty { Format::pretty() } else { Format::compact() };
+        let text = jsonx_lib::to_string(&v);
+        let mut out = String::new();
+        let mut w = Writer::new(&mut out).with_format(format);
+        for event in GRAMMAR_ONLY.reader(&text) {
+            prop_assert!(w.event(&event.unwrap_or(Event::Null)).is_ok());
+        }
+        prop_assert!(w.finish().is_ok());
+        prop_assert_eq!(out, jsonx_lib::to_string_with(&v, format));
+    }
+
+    /// `Reader::find_pointer` finds what `Value::pointer` finds, for every
+    /// pointer to a value in the document and some that miss.
+    #[test]
+    fn prop_find_pointer_matches_value_pointer(v in value()) {
+        let text = jsonx_lib::to_string_pretty(&v);
+        // Every path in the value, breadth first, capped.
+        let mut paths = vec![String::new()];
+        let mut i = 0;
+        while i < paths.len() && paths.len() < 64 {
+            let path = paths[i].clone();
+            if let Some(target) = v.pointer(&path) {
+                match target {
+                    Value::Array(a) => paths.extend((0..=a.len()).map(|n| format!("{path}/{n}"))),
+                    Value::Object(o) => {
+                        for key in o.keys() {
+                            paths.push(format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")));
+                        }
+                        paths.push(format!("{path}/no such key"));
+                    }
+                    _ => paths.push(format!("{path}/0")),
+                }
+            }
+            i += 1;
+        }
+        paths.extend(["x", "/~2", "/01"].map(String::from));
+        for path in &paths {
+            let found = GRAMMAR_ONLY.reader(&text).find_pointer(path);
+            let found = found.ok().flatten().and_then(|raw| GRAMMAR_ONLY.parse(raw).ok());
+            prop_assert_eq!(found.as_ref(), v.pointer(path), "{}", path);
+        }
+    }
+
+    /// `Hash` agrees with `==`: a value and its round trip hash alike.
+    #[test]
+    fn prop_hash_agrees_with_eq(v in value()) {
+        use std::hash::{BuildHasher, RandomState};
+        let state = RandomState::new();
+        let text = jsonx_lib::to_string(&v);
+        let back = GRAMMAR_ONLY.parse(&text).unwrap_or_default();
+        prop_assert_eq!(&back, &v);
+        prop_assert_eq!(state.hash_one(&back), state.hash_one(&v));
+        prop_assert_eq!(state.hash_one(back.into_owned()), state.hash_one(&v));
+    }
+
     /// Clone, equality, and `into_owned` agree with each other.
     #[test]
     fn prop_clone_and_into_owned_preserve_equality(v in value()) {
@@ -304,6 +321,69 @@ proptest! {
         let parsed = GRAMMAR_ONLY.parse(&text).unwrap_or_default();
         prop_assert_eq!(&parsed.clone(), &v);
         prop_assert_eq!(parsed.into_owned(), v.clone());
+    }
+}
+
+/// Objects whose keys come from a small set, so they often repeat.
+fn repeating_objects() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec!["a", "b", "\\u0061", "c\\n", "c\\u000a"]);
+    let leaf = prop_oneof![
+        Just("1".to_owned()),
+        Just("[]".to_owned()),
+        Just("\"x\"".to_owned())
+    ];
+    leaf.prop_recursive(4, 40, 6, move |inner| {
+        prop_oneof![
+            prop::collection::vec((key.clone(), inner.clone()), 0..6).prop_map(|members| {
+                let body: Vec<String> = members
+                    .iter()
+                    .map(|(k, v)| format!("\"{k}\":{v}"))
+                    .collect();
+                format!("{{{}}}", body.join(","))
+            }),
+            prop::collection::vec(inner, 0..4).prop_map(|items| format!("[{}]", items.join(","))),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    /// JX-SEC-02: under the default policy, every way of reading refuses the
+    /// same duplicate at the same offset: `parse`, the event loop,
+    /// `read_raw`, and the incremental reader.
+    #[test]
+    fn prop_every_reading_path_refuses_the_same_duplicates(text in repeating_objects(), cut in any::<Index>()) {
+        let parsed = jsonx_lib::parse(&text).err();
+        let mut events = jsonx_lib::Reader::new(&text);
+        let streamed = loop {
+            match events.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break None,
+                Err(e) => break Some(e),
+            }
+        };
+        prop_assert_eq!(streamed, parsed);
+        prop_assert_eq!(jsonx_lib::Reader::new(&text).read_raw().err(), parsed);
+        // A pointer lookup answers only for a document without repeats, a
+        // member whose key repeats included.
+        for pointer in ["", "/a", "/0", "/a/a", "/b/0/a"] {
+            let found = jsonx_lib::Reader::new(&text).find_pointer(pointer);
+            prop_assert_eq!(found.err(), parsed, "{}", pointer);
+        }
+        let mut incremental = jsonx_lib::StreamReader::new();
+        let at = cut.index(text.len() + 1);
+        let (head, tail) = text.as_bytes().split_at(at);
+        prop_assert!(incremental.feed(head).is_ok());
+        let raw = match incremental.read_raw() {
+            Err(e) => Err(e),
+            Ok(jsonx_lib::Step::Ready(_)) => Ok(()),
+            Ok(jsonx_lib::Step::NeedInput) => incremental.feed(tail).and_then(|()| {
+                incremental.end_input();
+                incremental.read_raw().map(|_| ())
+            }),
+        };
+        prop_assert_eq!(raw.err(), parsed);
     }
 }
 

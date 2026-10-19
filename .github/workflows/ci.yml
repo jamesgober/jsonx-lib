@@ -5,6 +5,12 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Weekly, for new RustSec advisories against an unchanged tree.
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,10 +51,88 @@ jobs:
         run: cargo test --no-default-features
       - name: Build examples
         run: cargo build --examples
+      - name: Build benches
+        run: cargo bench --no-run
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  no-std:
+    name: no_std (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Build without std on a target that has none
+        run: cargo build --no-default-features --target thumbv7em-none-eabihf
+
+  i686:
+    name: 32-bit (i686-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the 32-bit C toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Test (all features)
+        run: cargo test --all-features --target i686-unknown-linux-gnu
+      - name: Test (no default features)
+        run: cargo test --no-default-features --target i686-unknown-linux-gnu
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Run every target for 60 seconds
+        working-directory: fuzz
+        run: |
+          for target in parse reader stream decode write; do
+            # The prebuilt cargo-fuzz defaults to musl, which ASan cannot link.
+            # Inputs up to 16 KiB: past the stream reader's 4 KiB compaction.
+            cargo fuzz run -O --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -max_len=16384 -rss_limit_mb=2048
+          done
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Line coverage (all features)
+        run: cargo llvm-cov --all-features --summary-only --fail-under-lines 95
+
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the published release
+        uses: obi1kenobi/cargo-semver-checks-action@v2
 
   security:
     name: Security (audit + deny)

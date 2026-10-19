@@ -1,12 +1,13 @@
 //! The pull reader: a document as a stream of events, without building a tree.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::borrow::Cow;
 use core::iter::FusedIterator;
 
 use crate::{
-    DuplicateKeys, Limits, Number, Value,
+    DuplicateKeys, Kind, Limits, Number, Value,
     error::{Error, ErrorKind},
-    lexer, parser, scan,
+    machine::Machine,
+    parser,
 };
 
 /// One step through a document, from [`Reader::next_event`].
@@ -56,36 +57,6 @@ pub enum Event<'a> {
     Null,
 }
 
-/// What the reader expects next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
-    /// A value: at the start, or after a member's `:`.
-    Value,
-    /// A value after `,` in an array; `]` here is a trailing comma.
-    Element,
-    /// Just after `[`: a value or `]`.
-    ArrayFirst,
-    /// After an array item: `,` or `]`.
-    ArrayNext,
-    /// Just after `{`: a key or `}`.
-    ObjectFirst,
-    /// After `,` in an object: a key; `}` here is a trailing comma.
-    Key,
-    /// After a member's value: `,` or `}`.
-    ObjectNext,
-    /// The document's value is complete: only whitespace may follow.
-    End,
-    /// The end was reached and reported.
-    Done,
-}
-
-/// Which container is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Container {
-    Array,
-    Object,
-}
-
 /// A pull parser: reads a document one [`Event`] at a time, building nothing.
 ///
 /// The reader is the layer every parse in this crate goes through: it checks
@@ -97,10 +68,28 @@ enum Container {
 ///
 /// The reader works over a complete document held in memory, and borrows
 /// strings and numbers from it exactly as [`parse`](crate::parse) does.
-/// Reading is iterative: depth costs one byte of reader state per level, never
-/// stack. The reader does not look for duplicate keys, which needs memory
-/// proportional to an object's size; [`read_value`](Self::read_value) applies
-/// the configured [`DuplicateKeys`] policy to the values it builds.
+/// Reading is iterative: depth costs one bit of reader state per level, never
+/// stack. The reader's own state for the first 64 levels, 8 open objects, and
+/// 16 of their keys is kept inline, so reading a message of ordinary shape
+/// allocates nothing but the strings it decodes.
+///
+/// **Duplicate keys.** Under [`DuplicateKeys::Error`], the default, the
+/// reader refuses an object that repeats a key, whichever way it is read:
+/// event by event, through [`read_raw`](Self::read_raw), or through
+/// [`read_value`](Self::read_value). The check happens when the object
+/// closes, so the `}` of an object with a repeated key is never returned as
+/// [`Event::EndObject`]: the reader returns [`ErrorKind::DuplicateKey`] at
+/// the repeat's opening quote instead. A loop that collects members and acts
+/// only after the object ended (as below) can therefore never act on a
+/// smuggled second value. To check, the reader keeps, for each key of the
+/// objects still open, its offset and a one-word fingerprint of its decoded
+/// text; an object whose fingerprints may match, or with more than 16 keys,
+/// has its keys read again from the input (and decoded where escaped) when
+/// it closes, and compared as text. (A [`StreamReader`](crate::StreamReader),
+/// whose input's front is dropped as it is read, keeps a decoded copy of
+/// each key instead.) Under the other policies the reader passes every
+/// member through as written; [`read_value`](Self::read_value) applies
+/// `First` and `Last` to the values it builds.
 ///
 /// After an error the reader is finished: every later call returns the same
 /// error.
@@ -131,17 +120,16 @@ enum Container {
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     src: &'a str,
-    pos: usize,
-    /// Where the most recent event's token began.
-    last: usize,
-    state: State,
-    stack: Vec<Container>,
-    elements: usize,
-    limits: Limits,
-    duplicates: DuplicateKeys,
+    machine: Machine,
     failed: Option<Error>,
-    /// Set while [`Reader::read_raw`] skips a value: strings are not decoded.
-    skipping: bool,
+    /// Heap held by what the current top-level read has built (a tree, or
+    /// a typed value and everything inside it), against
+    /// [`Limits::max_memory`].
+    held: usize,
+    /// How many reads ([`read_value`](Self::read_value),
+    /// [`decode`](Self::decode)) are running, nested: the outermost one
+    /// starts `held` afresh, the ones inside it share its count.
+    reading: u32,
 }
 
 impl<'a> Reader<'a> {
@@ -169,16 +157,40 @@ impl<'a> Reader<'a> {
             .then(|| Error::new(ErrorKind::InputTooLarge, limits.max_input_bytes));
         Self {
             src: text,
-            pos: 0,
-            last: 0,
-            state: State::Value,
-            stack: Vec::new(),
-            elements: 0,
-            limits,
-            duplicates,
+            machine: Machine::new(limits, duplicates, true),
             failed,
-            skipping: false,
+            held: 0,
+            reading: 0,
         }
+    }
+
+    /// Reads a sequence of documents instead of one: after a document's
+    /// value, another may follow, separated by any whitespace (or by
+    /// nothing, where the grammar allows: `[1][2]`). This reads
+    /// newline-delimited JSON (NDJSON, JSON Lines) and concatenated JSON.
+    /// Each document has its own [`Limits::max_elements`]; the input size
+    /// budget covers them all. Events run on from one document into the
+    /// next; [`read_value`](Self::read_value) and the other whole-value
+    /// reads return one document each, and `Ok(None)` after the last.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Reader;
+    ///
+    /// let lines = "{\"n\": 1}\n{\"n\": 2}\n";
+    /// let mut r = Reader::new(lines).documents();
+    /// let mut total = 0;
+    /// while let Some(doc) = r.read_value()? {
+    ///     total += doc["n"].as_i64().unwrap_or(0);
+    /// }
+    /// assert_eq!(total, 3);
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn documents(mut self) -> Self {
+        self.machine.documents = true;
+        self
     }
 
     /// Reads the next event, or `Ok(None)` once the document's value is
@@ -205,11 +217,13 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        self.step().inspect_err(|&e| self.failed = Some(e))
+        self.machine
+            .step(self.src)
+            .inspect_err(|&e| self.failed = Some(e))
     }
 
     /// Reads the next value whole and returns its exact source text, without
-    /// decoding or allocating anything.
+    /// decoding or copying it.
     ///
     /// Call it where a value comes next: at the start, after a [`Key`](Event::Key),
     /// or between array items. The value is fully validated. If no value comes
@@ -219,11 +233,16 @@ impl<'a> Reader<'a> {
     /// it where a key comes next also returns `Ok(None)`.
     ///
     /// The text is a slice of the input: it can be stored, compared, or parsed
-    /// later, as `serde_json`'s `RawValue` is used.
+    /// later, as `serde_json`'s `RawValue` is used. Nothing of the value is
+    /// allocated; the reader's own state grows with the value's nesting (a
+    /// bit per level) and, under [`DuplicateKeys::Error`], with the keys of
+    /// its open objects, on the heap only past what it keeps inline (see
+    /// [`Reader`]).
     ///
     /// # Errors
     ///
-    /// As [`next_event`](Self::next_event), for any error inside the value.
+    /// As [`next_event`](Self::next_event), for any error inside the value,
+    /// including a repeated key under [`DuplicateKeys::Error`].
     ///
     /// # Examples
     ///
@@ -242,12 +261,12 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if !self.at_value()? {
+        if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
-        self.skipping = true;
+        self.machine.skipping = true;
         let result = self.skip_value();
-        self.skipping = false;
+        self.machine.skipping = false;
         result.map(Some)
     }
 
@@ -256,6 +275,10 @@ impl<'a> Reader<'a> {
     ///
     /// Positioning is as for [`read_raw`](Self::read_raw): `Ok(None)`, with
     /// nothing consumed, when no value comes next.
+    ///
+    /// Each call has its own [`Limits::max_memory`] count: the tree it builds
+    /// is bounded, and what earlier calls returned is not counted, so a large
+    /// array read item by item is limited per item, not in total.
     ///
     /// # Errors
     ///
@@ -280,13 +303,157 @@ impl<'a> Reader<'a> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if !self.at_value()? {
+        if !self.machine.at_value(self.src)? {
             return Ok(None);
         }
-        let duplicates = self.duplicates;
-        parser::build(self, duplicates)
-            .inspect_err(|&e| self.failed = Some(e))
-            .map(Some)
+        let duplicates = self.machine.duplicates;
+        self.begin_read();
+        let built = parser::build(self, duplicates);
+        self.end_read();
+        built.inspect_err(|&e| self.failed = Some(e)).map(Some)
+    }
+
+    /// The kind of the next value, without consuming anything: `None` when
+    /// no value comes next (positioning as for [`read_raw`](Self::read_raw)),
+    /// or when the next byte cannot start one (the next
+    /// [`next_event`](Self::next_event) reports why). Decided by the value's
+    /// first byte alone, so `tru` peeks as [`Kind::Bool`].
+    ///
+    /// Useful for a value that may be one of several shapes, such as LSP's
+    /// `string | number` ids.
+    ///
+    /// # Errors
+    ///
+    /// Any error the reader already stopped at.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Kind, Reader};
+    ///
+    /// let mut r = Reader::new(r#"[7, "seven"]"#);
+    /// r.next_event()?;
+    /// assert_eq!(r.peek_kind()?, Some(Kind::Number));
+    /// r.read_raw()?;
+    /// assert_eq!(r.peek_kind()?, Some(Kind::String));
+    /// r.read_raw()?;
+    /// assert_eq!(r.peek_kind()?, None); // the array ends
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    pub fn peek_kind(&mut self) -> Result<Option<Kind>, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        Ok(if self.machine.at_value(self.src)? {
+            self.machine.peek_kind(self.src)
+        } else {
+            None
+        })
+    }
+
+    /// Finds the value at an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)
+    /// JSON Pointer in the value that comes next, without building anything,
+    /// and returns its exact source text: what
+    /// [`Value::pointer`](crate::Value::pointer) would find, without the
+    /// tree. Everything before the target is read and validated; members and
+    /// items that are not on the way are skipped with
+    /// [`read_raw`](Self::read_raw).
+    ///
+    /// **Duplicate keys.** Under [`DuplicateKeys::Error`], the default, the
+    /// answer is given only for a value with no repeated key anywhere in it:
+    /// the reader reads the rest of the value it started on before
+    /// returning (and, started at the top of a document, the rest of the
+    /// document, as [`finish`](Self::finish) does), so
+    /// `{"method": "a", "method": "b"}` is refused, as by
+    /// [`parse`](crate::parse), rather than answered with either member. The
+    /// reader then stands past that value. Under the other policies it stops
+    /// just past the target, without reading the rest, and in an object the
+    /// first member with the key is the one taken.
+    ///
+    /// `Ok(None)` when the pointer is malformed or names nothing (as
+    /// `Value::pointer`'s `None`).
+    ///
+    /// # Errors
+    ///
+    /// Any error of the reader on the way to the target, or inside it, and
+    /// under `DuplicateKeys::Error` in the rest of the value (a repeated key
+    /// included).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Reader;
+    ///
+    /// let message = r#"{"jsonrpc": "2.0", "id": 9, "params": {"items": [{"label": "a"}, {"label": "b"}]}}"#;
+    /// assert_eq!(Reader::new(message).find_pointer("/params/items/1/label")?, Some(r#""b""#));
+    /// assert_eq!(Reader::new(message).find_pointer("/id")?, Some("9"));
+    /// assert_eq!(Reader::new(message).find_pointer("/params/missing")?, None);
+    ///
+    /// // A repeated key anywhere is refused, as `parse` refuses it.
+    /// let smuggled = r#"{"method": "initialize", "method": "shutdown"}"#;
+    /// assert!(Reader::new(smuggled).find_pointer("/method").is_err());
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    pub fn find_pointer(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
+        let depth = self.depth();
+        let found = self.find_in(pointer)?;
+        if self.machine.duplicates == DuplicateKeys::Error {
+            // The rest of the value, so that every object in it is checked.
+            while self.depth() > depth {
+                if self.next_event()?.is_none() {
+                    break;
+                }
+            }
+            if depth == 0 && !self.machine.documents {
+                self.read_to_end()?;
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`find_pointer`](Self::find_pointer) up to the target.
+    fn find_in(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
+        if pointer.is_empty() {
+            return self.read_raw();
+        }
+        let Some(rest) = pointer.strip_prefix('/') else {
+            return Ok(None);
+        };
+        for token in rest.split('/') {
+            let Some(token) = crate::value::unescape_pointer_token(token) else {
+                return Ok(None);
+            };
+            match self.peek_kind()? {
+                Some(Kind::Object) => {
+                    let _start = self.next_event()?;
+                    loop {
+                        match self.next_event()? {
+                            Some(Event::Key(key)) if key == token => break,
+                            Some(Event::Key(_)) => {
+                                let _skipped = self.read_raw()?;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                Some(Kind::Array) => {
+                    let Some(index) = crate::value::array_index(&token) else {
+                        return Ok(None);
+                    };
+                    let _start = self.next_event()?;
+                    for _ in 0..index {
+                        if self.read_raw()?.is_none() {
+                            return Ok(None);
+                        }
+                    }
+                    if self.peek_kind()?.is_none() {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        self.read_raw()
     }
 
     /// Reads to the end of the document, checking that the rest of it is
@@ -308,6 +475,13 @@ impl<'a> Reader<'a> {
     /// # Ok::<(), jsonx_lib::Error>(())
     /// ```
     pub fn finish(mut self) -> Result<(), Error> {
+        self.read_to_end()
+    }
+
+    /// [`finish`](Self::finish) in place, for the crate's own one-call
+    /// functions: the reader is not moved (it is several hundred bytes).
+    #[inline]
+    pub(crate) fn read_to_end(&mut self) -> Result<(), Error> {
         while self.next_event()?.is_some() {}
         Ok(())
     }
@@ -326,7 +500,7 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.stack.len()
+        self.machine.depth()
     }
 
     /// The byte offset just past the input consumed so far.
@@ -343,7 +517,7 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn offset(&self) -> usize {
-        self.pos
+        self.machine.pos
     }
 
     /// The byte offset where the most recent event's token began: the quote of
@@ -365,234 +539,134 @@ impl<'a> Reader<'a> {
     #[inline]
     #[must_use]
     pub fn event_offset(&self) -> usize {
-        self.last
+        self.machine.last
     }
 
     // ---- internals -----------------------------------------------------------
 
-    #[inline]
-    fn bytes(&self) -> &'a [u8] {
-        self.src.as_bytes()
+    /// Sets how typed reads take integers.
+    pub(crate) const fn with_numbers(mut self, numbers: crate::Numbers) -> Self {
+        self.machine.numbers = numbers;
+        self
     }
 
+    /// How typed reads take integers.
     #[inline]
-    fn skip_whitespace(&mut self) {
-        let bytes = self.bytes();
-        while bytes
-            .get(self.pos)
-            .copied()
-            .is_some_and(scan::is_whitespace)
-        {
-            self.pos += 1;
+    pub(crate) const fn number_policy(&self) -> crate::Numbers {
+        self.machine.numbers
+    }
+
+    /// Whether a value comes next (consuming a separating `,`).
+    #[inline]
+    pub(crate) fn at_a_value(&mut self) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        self.machine.at_value(self.src)
+    }
+
+    /// Enters the object (`object`) or array that comes next, if one does:
+    /// see [`Machine::enter`].
+    #[inline]
+    pub(crate) fn enter(&mut self, object: bool) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        self.machine
+            .enter(self.src, object)
+            .inspect_err(|&e| self.failed = Some(e))
+    }
+
+    /// The decoded text of the key whose opening quote is at `quote` (for an
+    /// error's path: the key is read again).
+    pub(crate) fn key_at(&self, quote: usize) -> alloc::string::String {
+        crate::machine::key_text(self.src, quote).into_owned()
+    }
+
+    /// [`at_a_value`](Self::at_a_value) inside an array, with the common
+    /// case (a `,` and an item, or a first item) inline.
+    #[inline]
+    pub(crate) fn at_item(&mut self) -> Result<bool, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        match self.machine.at_item(self.src) {
+            Some(more) => Ok(more),
+            None => self.machine.at_value(self.src),
         }
     }
 
+    /// Enters a read that builds something (a tree or a typed value). The
+    /// outermost one starts the memory count afresh: what an earlier call
+    /// built has been handed to the caller, who may have dropped it, so only
+    /// what one call builds is bounded. Reads nested inside it (a `Value`
+    /// field of a typed decode, a `decode` called from a `FromJson` impl)
+    /// share its count. Pair with [`end_read`](Self::end_read).
     #[inline]
-    fn end_error(&self) -> Error {
-        Error::new(ErrorKind::UnexpectedEnd, self.src.len())
+    pub(crate) fn begin_read(&mut self) {
+        if self.reading == 0 {
+            self.held = 0;
+        }
+        self.reading += 1;
     }
 
-    /// Moves past whitespace and a separating `,` and reports whether a value
-    /// comes next, without consuming any token of the value.
-    fn at_value(&mut self) -> Result<bool, Error> {
-        self.skip_whitespace();
-        let next = self.bytes().get(self.pos).copied();
-        Ok(match self.state {
-            State::Value | State::Element => true,
-            State::ArrayFirst => next != Some(b']'),
-            State::ArrayNext if next == Some(b',') => {
-                self.pos += 1;
-                self.state = State::Element;
-                true
-            }
-            _ => false,
-        })
+    /// Leaves a read entered with [`begin_read`](Self::begin_read).
+    #[inline]
+    pub(crate) fn end_read(&mut self) {
+        self.reading = self.reading.saturating_sub(1);
+    }
+
+    /// What the current top-level read holds, in bytes.
+    #[inline]
+    pub(crate) const fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Records `held` bytes held in all by the current top-level read.
+    #[inline]
+    pub(crate) fn set_held(&mut self, held: usize) {
+        self.held = held;
+    }
+
+    /// The memory budget, [`Limits::max_memory`].
+    #[inline]
+    pub(crate) const fn max_memory(&self) -> usize {
+        self.machine.limits.max_memory
+    }
+
+    /// Charges `bytes` more to the current top-level read, refusing them, as
+    /// [`ErrorKind::MemoryLimitExceeded`] at `at`, past
+    /// [`Limits::max_memory`].
+    #[inline]
+    pub(crate) fn charge(&mut self, bytes: usize, at: usize) -> Result<(), Error> {
+        let held = self.held.saturating_add(bytes);
+        if held > self.max_memory() {
+            return Err(Error::new(ErrorKind::MemoryLimitExceeded, at));
+        }
+        self.held = held;
+        Ok(())
+    }
+
+    /// The reader's duplicate-key policy.
+    #[inline]
+    pub(crate) fn duplicate_policy(&self) -> DuplicateKeys {
+        self.machine.duplicates
     }
 
     /// Consumes one whole value (the reader is positioned at it) and returns
     /// its text.
     fn skip_value(&mut self) -> Result<&'a str, Error> {
-        let depth = self.stack.len();
+        let depth = self.machine.depth();
         let first = self.next_event()?;
-        let start = self.last;
+        let start = self.machine.last;
         if matches!(first, Some(Event::StartArray | Event::StartObject)) {
-            while self.stack.len() > depth {
+            while self.machine.depth() > depth {
                 if self.next_event()?.is_none() {
-                    return Err(self.end_error());
+                    return Err(Error::new(ErrorKind::UnexpectedEnd, self.src.len()));
                 }
             }
         }
-        Ok(self.src.get(start..self.pos).unwrap_or(""))
-    }
-
-    /// The state after a value completes in the current container.
-    #[inline]
-    fn after_value(&mut self) {
-        self.state = match self.stack.last() {
-            None => State::End,
-            Some(Container::Array) => State::ArrayNext,
-            Some(Container::Object) => State::ObjectNext,
-        };
-    }
-
-    /// Closes the innermost container, whose closing byte is at `at`.
-    #[inline]
-    fn close(&mut self, at: usize, event: Event<'a>) -> Event<'a> {
-        self.pos = at + 1;
-        self.last = at;
-        let _closed = self.stack.pop();
-        self.after_value();
-        event
-    }
-
-    fn step(&mut self) -> Result<Option<Event<'a>>, Error> {
-        loop {
-            self.skip_whitespace();
-            let at = self.pos;
-            let next = self.bytes().get(at).copied();
-            let err = |kind| Err(Error::new(kind, at));
-            match self.state {
-                State::Value | State::Element | State::ArrayFirst => match next {
-                    None => return Err(self.end_error()),
-                    Some(b']') if self.state == State::ArrayFirst => {
-                        return Ok(Some(self.close(at, Event::EndArray)));
-                    }
-                    Some(b']') if self.state == State::Element => {
-                        return err(ErrorKind::TrailingComma);
-                    }
-                    Some(b) => return self.value(b, at).map(Some),
-                },
-                State::ArrayNext => match next {
-                    None => return Err(self.end_error()),
-                    Some(b',') => {
-                        self.pos += 1;
-                        self.state = State::Element;
-                    }
-                    Some(b']') => return Ok(Some(self.close(at, Event::EndArray))),
-                    Some(_) => return err(ErrorKind::ExpectedCommaOrBracket),
-                },
-                State::ObjectFirst | State::Key => match next {
-                    None => return Err(self.end_error()),
-                    Some(b'"') => return self.key(at).map(Some),
-                    Some(b'}') if self.state == State::ObjectFirst => {
-                        return Ok(Some(self.close(at, Event::EndObject)));
-                    }
-                    Some(b'}') => return err(ErrorKind::TrailingComma),
-                    Some(_) => return err(ErrorKind::ExpectedKey),
-                },
-                State::ObjectNext => match next {
-                    None => return Err(self.end_error()),
-                    Some(b',') => {
-                        self.pos += 1;
-                        self.state = State::Key;
-                    }
-                    Some(b'}') => return Ok(Some(self.close(at, Event::EndObject))),
-                    Some(_) => return err(ErrorKind::ExpectedCommaOrBrace),
-                },
-                State::End => {
-                    return match next {
-                        None => {
-                            self.state = State::Done;
-                            Ok(None)
-                        }
-                        Some(_) => err(ErrorKind::TrailingCharacters),
-                    };
-                }
-                State::Done => return Ok(None),
-            }
-        }
-    }
-
-    /// Counts one more value, refusing it if the budget is spent.
-    #[inline]
-    fn count_value(&mut self, at: usize) -> Result<(), Error> {
-        if self.elements >= self.limits.max_elements {
-            return Err(Error::new(ErrorKind::TooManyElements, at));
-        }
-        self.elements += 1;
-        Ok(())
-    }
-
-    /// Reads the value starting with byte `b` at `at`.
-    fn value(&mut self, b: u8, at: usize) -> Result<Event<'a>, Error> {
-        let bytes = self.bytes();
-        let event = match b {
-            b'{' | b'[' => {
-                self.count_value(at)?;
-                if self.stack.len() >= self.limits.max_depth {
-                    return Err(Error::new(ErrorKind::DepthLimitExceeded, at));
-                }
-                self.pos = at + 1;
-                if b == b'{' {
-                    self.stack.push(Container::Object);
-                    self.state = State::ObjectFirst;
-                    Event::StartObject
-                } else {
-                    self.stack.push(Container::Array);
-                    self.state = State::ArrayFirst;
-                    Event::StartArray
-                }
-            }
-            b'"' => {
-                self.count_value(at)?;
-                Event::String(self.string(at)?)
-            }
-            b'-' | b'0'..=b'9' => {
-                self.count_value(at)?;
-                let end = lexer::scan_number(bytes, at, self.limits.max_number_bytes)?;
-                self.pos = end;
-                self.after_value();
-                Event::Number(Number::from_valid(self.src.get(at..end).unwrap_or("0")))
-            }
-            b't' | b'f' | b'n' => {
-                self.count_value(at)?;
-                let (word, event): (&[u8], _) = match b {
-                    b't' => (b"true", Event::Bool(true)),
-                    b'f' => (b"false", Event::Bool(false)),
-                    _ => (b"null", Event::Null),
-                };
-                self.pos = lexer::scan_literal(bytes, at, word)?;
-                self.after_value();
-                event
-            }
-            _ => return Err(Error::new(ErrorKind::ExpectedValue, at)),
-        };
-        self.last = at;
-        Ok(event)
-    }
-
-    /// Reads the string value whose quote is at `at`.
-    fn string(&mut self, at: usize) -> Result<Cow<'a, str>, Error> {
-        let text = self.string_body(at)?;
-        self.after_value();
-        Ok(text)
-    }
-
-    /// Reads the key whose quote is at `at`, and the `:` after it.
-    fn key(&mut self, at: usize) -> Result<Event<'a>, Error> {
-        let key = self.string_body(at)?;
-        self.skip_whitespace();
-        match self.bytes().get(self.pos) {
-            Some(b':') => self.pos += 1,
-            Some(_) => return Err(Error::new(ErrorKind::ExpectedColon, self.pos)),
-            None => return Err(self.end_error()),
-        }
-        self.state = State::Value;
-        self.last = at;
-        Ok(Event::Key(key))
-    }
-
-    /// Scans the string at `at` and returns its contents: borrowed when it has
-    /// no escapes (or while skipping), decoded otherwise.
-    fn string_body(&mut self, at: usize) -> Result<Cow<'a, str>, Error> {
-        let token = lexer::scan_string(self.bytes(), at, self.limits.max_string_bytes)?;
-        self.pos = token.end;
-        let body = self.src.get(at + 1..token.end - 1).unwrap_or("");
-        Ok(if token.escaped && !self.skipping {
-            Cow::Owned(lexer::decode(body))
-        } else {
-            Cow::Borrowed(body)
-        })
+        Ok(self.src.get(start..self.machine.pos).unwrap_or(""))
     }
 }
 
@@ -602,7 +676,7 @@ impl<'a> Iterator for Reader<'a> {
     /// The next event; after the end or an error, `None`. An error is yielded
     /// once.
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed.is_some() && self.state == State::Done {
+        if self.failed.is_some() && self.machine.is_done() {
             return None;
         }
         match self.next_event() {
@@ -610,7 +684,7 @@ impl<'a> Iterator for Reader<'a> {
             Ok(None) => None,
             Err(e) => {
                 // Yield the error once, then stop.
-                self.state = State::Done;
+                self.machine.finish_iteration();
                 Some(Err(e))
             }
         }

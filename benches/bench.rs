@@ -10,7 +10,9 @@
 use std::{fmt::Write as _, hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use jsonx_lib::{DuplicateKeys, Event, Limits, Number, Parser, Value};
+use std::borrow::Cow;
+
+use jsonx_lib::{DuplicateKeys, Event, Limits, Number, Parser, Step, Value, json_struct};
 
 /// No budgets: the 100 MB document is over the default 64 MiB input budget.
 const UNLIMITED: Parser = Parser::new().limits(Limits::unlimited());
@@ -93,6 +95,37 @@ fn bench_100mb(c: &mut Criterion) {
     bench_size(c, "doc_100mb", 100 << 20, 10, 20);
 }
 
+/// The 1 MB document pretty-printed: whitespace is about a third of it, so
+/// skipping indentation is a real share of the work.
+fn bench_pretty(c: &mut Criterion) {
+    let text =
+        jsonx_lib::to_string_pretty(&UNLIMITED.parse(&document(1 << 20)).unwrap_or_default());
+    let mut group = c.benchmark_group("pretty_1mb");
+    group
+        .sample_size(50)
+        .measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Bytes(text.len() as u64));
+    group.bench_function("reader_events", |b| {
+        b.iter(|| {
+            let mut reader = UNLIMITED.reader(black_box(&text));
+            let mut n = 0usize;
+            while let Ok(Some(event)) = reader.next_event() {
+                n += usize::from(!matches!(event, Event::Null));
+            }
+            n
+        });
+    });
+    group.bench_function("read_raw_validate_only", |b| {
+        b.iter(|| {
+            UNLIMITED
+                .reader(black_box(&text))
+                .read_raw()
+                .map(|r| r.map(str::len))
+        });
+    });
+    group.finish();
+}
+
 fn bench_strings(c: &mut Criterion) {
     let mut group = c.benchmark_group("strings_1mb");
     let sparse: String = "The quick brown fox jumps over the lazy dog. ".repeat(23_302);
@@ -156,9 +189,92 @@ fn bench_numbers(c: &mut Criterion) {
     group.finish();
 }
 
+/// One item of the document, as typed data: strings borrowed where the
+/// text has no escapes.
+struct Item<'a> {
+    id: u64,
+    label: &'a str,
+    detail: Cow<'a, str>,
+    kind: u8,
+    score: f64,
+    deprecated: bool,
+    range: Range,
+    tags: Vec<Option<Cow<'a, str>>>,
+    data: Vec<i64>,
+}
+json_struct!(Item<'a> { id, label, detail, kind, score, deprecated, range, tags, data });
+
+struct Range {
+    start: Pos,
+    end: Pos,
+}
+json_struct!(Range { start, end });
+
+struct Pos {
+    line: u32,
+    character: u32,
+}
+json_struct!(Pos { line, character });
+
+/// Typed reading (`FromJson`) and writing (`ToJson`) of the 1 MB document,
+/// against the same through a `Value`.
+fn bench_typed(c: &mut Criterion) {
+    let text = document(1 << 20);
+    let items: Vec<Item<'_>> = UNLIMITED.decode(&text).unwrap_or_default();
+    let mut group = c.benchmark_group("typed_1mb");
+    group
+        .sample_size(50)
+        .measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Bytes(text.len() as u64));
+    group.bench_function("decode_structs", |b| {
+        b.iter(|| {
+            UNLIMITED
+                .decode::<Vec<Item<'_>>>(black_box(&text))
+                .map(|v| v.len())
+        })
+    });
+    group.bench_function("encode_structs", |b| {
+        b.iter(|| jsonx_lib::to_string(black_box(&items)))
+    });
+    group.finish();
+}
+
+/// The incremental reader over the 1 MB document, fed in network-sized
+/// chunks, against the complete reader over the same text.
+fn bench_stream(c: &mut Criterion) {
+    let text = document(1 << 20);
+    let mut group = c.benchmark_group("stream_1mb");
+    group
+        .sample_size(50)
+        .measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Bytes(text.len() as u64));
+    for chunk in [1500usize, 64 * 1024] {
+        group.bench_with_input(BenchmarkId::new("events", chunk), &chunk, |b, &chunk| {
+            b.iter(|| {
+                let mut reader = UNLIMITED.stream_reader();
+                let mut n = 0usize;
+                for piece in black_box(&text).as_bytes().chunks(chunk) {
+                    if reader.feed(piece).is_err() {
+                        break;
+                    }
+                    while let Ok(Step::Ready(Some(event))) = reader.next_event() {
+                        n += usize::from(!matches!(event, Event::Null));
+                    }
+                }
+                reader.end_input();
+                n
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_1mb,
+    bench_pretty,
+    bench_typed,
+    bench_stream,
     bench_strings,
     bench_numbers,
     bench_100mb

@@ -40,6 +40,37 @@ pub struct Number<'a> {
     text: Cow<'a, str>,
 }
 
+/// The value of `text` if it is all ASCII digits (an integer's text, sign
+/// removed) and fits a `u64`; `None` for anything else, a fraction or
+/// exponent included. One pass, with no overflow check below 20 digits.
+#[inline]
+fn digits(text: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0;
+    if text.len() < 20 {
+        if text.is_empty() {
+            return None;
+        }
+        // At most 19 digits: below `u64::MAX`.
+        for &b in text {
+            let digit = b.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + u64::from(digit);
+        }
+        Some(value)
+    } else {
+        for &b in text {
+            let digit = b.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(u64::from(digit))?;
+        }
+        Some(value)
+    }
+}
+
 impl<'a> Number<'a> {
     /// Wraps text the tokenizer has already checked.
     #[inline]
@@ -146,11 +177,11 @@ impl<'a> Number<'a> {
     /// assert_eq!(n("3.0").as_i64(), None); // not an integer's text
     /// ```
     #[must_use]
+    #[inline]
     pub fn as_i64(&self) -> Option<i64> {
-        if self.is_integer() {
-            self.text.parse().ok()
-        } else {
-            None
+        match self.text.strip_prefix('-') {
+            Some(magnitude) => 0i64.checked_sub_unsigned(digits(magnitude.as_bytes())?),
+            None => i64::try_from(digits(self.text.as_bytes())?).ok(),
         }
     }
 
@@ -169,17 +200,159 @@ impl<'a> Number<'a> {
     /// assert_eq!(n("-0").as_u64(), Some(0));
     /// ```
     #[must_use]
+    #[inline]
     pub fn as_u64(&self) -> Option<u64> {
-        if !self.is_integer() {
-            return None;
-        }
         match self.text.strip_prefix('-') {
             // The grammar forbids leading zeros, so `-0` is the only negative
             // integer text with a value `u64` can hold.
             Some("0") => Some(0),
             Some(_) => None,
+            None => digits(self.text.as_bytes()),
+        }
+    }
+
+    /// The number as an `i128`, if its text is an integer in `i128`'s range.
+    /// `None` otherwise: nothing is rounded or truncated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let big = Number::from_text("-170141183460469231731687303715884105728").unwrap();
+    /// assert_eq!(big.as_i128(), Some(i128::MIN));
+    /// assert_eq!(Number::from_text("1e3").unwrap().as_i128(), None);
+    /// ```
+    #[must_use]
+    pub fn as_i128(&self) -> Option<i128> {
+        if self.is_integer() {
+            self.text.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// The number as a `u128`, if its text is an integer in `u128`'s range.
+    /// `-0` reads as `0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let n = Number::from_text("340282366920938463463374607431768211455").unwrap();
+    /// assert_eq!(n.as_u128(), Some(u128::MAX));
+    /// assert_eq!(Number::from_text("-0").unwrap().as_u128(), Some(0));
+    /// assert_eq!(Number::from_text("-1").unwrap().as_u128(), None);
+    /// ```
+    #[must_use]
+    pub fn as_u128(&self) -> Option<u128> {
+        if !self.is_integer() {
+            return None;
+        }
+        match self.text.strip_prefix('-') {
+            Some("0") => Some(0),
+            Some(_) => None,
             None => self.text.parse().ok(),
         }
+    }
+
+    /// The number's value, if it is a whole number in `i128`'s range,
+    /// however it is written: `100`, `1e2`, `100.0`, and `1000e-1` are all
+    /// `Some(100)`, `-0.0` is `Some(0)`, and `1.5` or `1e40` are `None`. The
+    /// decimal digits and the exponent are worked exactly: nothing goes
+    /// through floating point, so nothing is rounded.
+    ///
+    /// [`as_i64`](Self::as_i64) and its siblings read integer *text* only;
+    /// this reads integer *values*, for data from writers that put whole
+    /// numbers in exponent or fraction form. See also
+    /// [`Numbers::WholeValues`](crate::Numbers::WholeValues).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let n = |s| Number::from_text(s).unwrap();
+    /// assert_eq!(n("1e2").whole_value(), Some(100));
+    /// assert_eq!(n("2.50e1").whole_value(), Some(25));
+    /// assert_eq!(n("-12.000").whole_value(), Some(-12));
+    /// assert_eq!(n("0.5e1").whole_value(), Some(5));
+    /// assert_eq!(n("1.25").whole_value(), None);
+    /// assert_eq!(n("1e39").whole_value(), None); // past i128
+    /// ```
+    #[must_use]
+    pub fn whole_value(&self) -> Option<i128> {
+        let text = self.text.as_bytes();
+        let (negative, text) = match text.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, text),
+        };
+        let (mantissa, exponent) = match text.iter().position(|&b| b == b'e' || b == b'E') {
+            Some(at) => (text.get(..at)?, text.get(at + 1..)?),
+            None => (text, &b""[..]),
+        };
+        let (int, frac) = match mantissa.iter().position(|&b| b == b'.') {
+            Some(at) => (mantissa.get(..at)?, mantissa.get(at + 1..)?),
+            None => (mantissa, &b""[..]),
+        };
+        // The exponent, saturated: anything past +-2^62 is far out of range
+        // or far below one either way.
+        let (exp_negative, exp_digits) = match exponent.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            Some((b'+', rest)) => (false, rest),
+            _ => (false, exponent),
+        };
+        let mut exp: i64 = 0;
+        for &d in exp_digits {
+            exp = exp.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+        }
+        if exp_negative {
+            exp = -exp;
+        }
+        // The significant digits, and the power of ten they are scaled by.
+        let digits = int.iter().chain(frac.iter()).copied();
+        let mut scale = exp.saturating_sub(frac.len() as i64);
+        let significant: alloc::vec::Vec<u8> = digits.skip_while(|&d| d == b'0').collect();
+        let trailing = significant.iter().rev().take_while(|&&d| d == b'0').count();
+        let significant = significant.get(..significant.len() - trailing)?;
+        scale = scale.saturating_add(trailing as i64);
+        if significant.is_empty() {
+            return Some(0);
+        }
+        if scale < 0 || (significant.len() as i64).saturating_add(scale) > 39 {
+            return None;
+        }
+        let mut magnitude: u128 = 0;
+        for &d in significant {
+            magnitude = magnitude
+                .checked_mul(10)?
+                .checked_add(u128::from(d - b'0'))?;
+        }
+        for _ in 0..scale {
+            magnitude = magnitude.checked_mul(10)?;
+        }
+        if negative {
+            0i128.checked_sub_unsigned(magnitude)
+        } else {
+            i128::try_from(magnitude).ok()
+        }
+    }
+
+    /// The number as the nearest `f32` (correctly rounded from the text
+    /// itself, not through `f64`), or `None` if that is not finite (`1e39`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// assert_eq!(Number::from_text("0.1").unwrap().as_f32(), Some(0.1));
+    /// assert_eq!(Number::from_text("1e39").unwrap().as_f32(), None);
+    /// ```
+    #[must_use]
+    pub fn as_f32(&self) -> Option<f32> {
+        self.text.parse::<f32>().ok().filter(|x| x.is_finite())
     }
 
     /// The number as the nearest `f64` (correctly rounded), or `None` if it is
@@ -225,14 +398,13 @@ impl<'a> Number<'a> {
 }
 
 macro_rules! from_integer {
-    ($($t:ty),*) => {$(
+    ($($t:ty => $via:ty, $write:ident);* $(;)?) => {$(
         impl From<$t> for Number<'static> {
             /// Writes the integer in decimal.
             #[inline]
             fn from(value: $t) -> Self {
                 let mut text = String::new();
-                // Writing to a `String` cannot fail.
-                let _infallible = write!(text, "{value}");
+                $write(&mut text, <$via>::from(value));
                 Self { text: Cow::Owned(text) }
             }
         }
@@ -240,8 +412,42 @@ macro_rules! from_integer {
 }
 
 from_integer!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+    i8 => i64, write_i64; i16 => i64, write_i64; i32 => i64, write_i64; i64 => i64, write_i64;
+    u8 => u64, write_u64; u16 => u64, write_u64; u32 => u64, write_u64; u64 => u64, write_u64;
+    i128 => i128, write_i128; u128 => u128, write_u128;
 );
+
+impl From<isize> for Number<'static> {
+    /// Writes the integer in decimal.
+    #[inline]
+    fn from(value: isize) -> Self {
+        let mut text = String::new();
+        // `isize` is at most 64 bits on every target Rust supports; the
+        // 128-bit path covers anything wider.
+        match i64::try_from(value) {
+            Ok(n) => write_i64(&mut text, n),
+            Err(_) => write_i128(&mut text, value as i128),
+        }
+        Self {
+            text: Cow::Owned(text),
+        }
+    }
+}
+
+impl From<usize> for Number<'static> {
+    /// Writes the integer in decimal.
+    #[inline]
+    fn from(value: usize) -> Self {
+        let mut text = String::new();
+        match u64::try_from(value) {
+            Ok(n) => write_u64(&mut text, n),
+            Err(_) => write_u128(&mut text, value as u128),
+        }
+        Self {
+            text: Cow::Owned(text),
+        }
+    }
+}
 
 impl fmt::Display for Number<'_> {
     /// Writes the number's exact text.
@@ -278,32 +484,124 @@ fn zeros(out: &mut String, count: usize) {
     out.extend(core::iter::repeat_n('0', count));
 }
 
+/// Appends `value` in decimal. Digits are produced into a stack buffer, so
+/// nothing is allocated beyond `out`'s own growth.
+#[inline]
+pub(crate) fn write_u64(out: &mut String, value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        if let Some(slot) = digits.get_mut(at) {
+            // `rest % 10` is below 10.
+            *slot = b'0' + (rest % 10) as u8;
+        }
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    out.push_str(core::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or("0"));
+}
+
+/// Appends `value` in decimal.
+#[inline]
+pub(crate) fn write_i64(out: &mut String, value: i64) {
+    if value < 0 {
+        out.push('-');
+    }
+    write_u64(out, value.unsigned_abs());
+}
+
+/// Appends `value` in decimal; 128-bit division only above `u64::MAX`.
+pub(crate) fn write_u128(out: &mut String, value: u128) {
+    if let Ok(small) = u64::try_from(value) {
+        return write_u64(out, small);
+    }
+    let mut digits = [0u8; 39];
+    let mut at = digits.len();
+    let mut rest = value;
+    while rest > 0 {
+        at -= 1;
+        if let Some(slot) = digits.get_mut(at) {
+            *slot = b'0' + (rest % 10) as u8;
+        }
+        rest /= 10;
+    }
+    out.push_str(core::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or("0"));
+}
+
+/// Appends `value` in decimal.
+pub(crate) fn write_i128(out: &mut String, value: i128) {
+    if value < 0 {
+        out.push('-');
+    }
+    write_u128(out, value.unsigned_abs());
+}
+
 /// The shortest round-trip text for a finite `f64`, laid out as described on
 /// [`Number::from_f64`].
+fn format_f64(value: f64) -> Option<String> {
+    let mut out = String::with_capacity(26);
+    write_f64(&mut out, value).then_some(out)
+}
+
+/// Appends the shortest round-trip text for `value`, laid out as described
+/// on [`Number::from_f64`]. Returns `false`, writing nothing, for NaN and
+/// the infinities.
 ///
 /// `core`'s `{:e}` formatting already yields the shortest digit string that
 /// reads back as the same `f64` (it is the same algorithm `Display` uses); this
 /// only moves the decimal point.
-fn format_f64(value: f64) -> Option<String> {
+pub(crate) fn write_f64(out: &mut String, value: f64) -> bool {
     if !value.is_finite() {
-        return None;
+        return false;
     }
     let mut sci = StackText {
         buf: [0; 40],
         len: 0,
     };
-    write!(sci, "{value:e}").ok()?;
-    let sci = core::str::from_utf8(sci.buf.get(..sci.len)?).ok()?;
+    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+}
+
+/// As [`write_f64`] for an `f32`: the shortest text that reads back as the
+/// same `f32` (`0.1f32` is `0.1`, not the `0.10000000149011612` of its
+/// widening to `f64`).
+pub(crate) fn write_f32(out: &mut String, value: f32) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    let mut sci = StackText {
+        buf: [0; 40],
+        len: 0,
+    };
+    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+}
+
+/// Lays out `{:e}` text (`-1.5e-7`) as JSON, decimals for exponents from -5
+/// up to 15 and exponent form otherwise. Writes nothing and returns `false`
+/// if `sci` is not in that form (it always is).
+fn layout(out: &mut String, sci: &StackText) -> bool {
+    let Some(sci) = sci
+        .buf
+        .get(..sci.len)
+        .and_then(|b| core::str::from_utf8(b).ok())
+    else {
+        return false;
+    };
     let (negative, sci) = match sci.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, sci),
     };
-    let (mantissa, exponent) = sci.split_once('e')?;
-    let exponent: i32 = exponent.parse().ok()?;
+    let Some((mantissa, exponent)) = sci.split_once('e') else {
+        return false;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return false;
+    };
     // `{:e}` writes one digit before the point.
     let (lead, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-
-    let mut out = String::with_capacity(26);
     if negative {
         out.push('-');
     }
@@ -313,16 +611,17 @@ fn format_f64(value: f64) -> Option<String> {
             out.push_str(lead);
             if frac.len() <= point {
                 out.push_str(frac);
-                zeros(&mut out, point - frac.len());
+                zeros(out, point - frac.len());
                 out.push_str(".0");
             } else {
-                out.push_str(frac.get(..point)?);
+                let (int, rest) = frac.split_at_checked(point).unwrap_or((frac, ""));
+                out.push_str(int);
                 out.push('.');
-                out.push_str(frac.get(point..)?);
+                out.push_str(rest);
             }
         } else {
             out.push_str("0.");
-            zeros(&mut out, exponent.unsigned_abs() as usize - 1);
+            zeros(out, exponent.unsigned_abs() as usize - 1);
             out.push_str(lead);
             out.push_str(frac);
         }
@@ -332,11 +631,11 @@ fn format_f64(value: f64) -> Option<String> {
             out.push('.');
             out.push_str(frac);
         }
-        write!(out, "e{exponent}").ok()?;
+        out.push('e');
+        write_i64(out, i64::from(exponent));
     }
-    Some(out)
+    true
 }
-
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
@@ -344,6 +643,47 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn test_integer_reads_agree_with_the_standard_parser() {
+        let texts = [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "9",
+            "10",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999",
+            "100000000000000000000",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "1234567890123456789",
+            "12345678901234567890",
+            "-12345678901234567890",
+            "1.0",
+            "1e2",
+            "-1.5",
+            "0.0",
+            "-0e0",
+            "123456789012345678901234567890",
+        ];
+        for text in texts {
+            let n = Number::from_text(text).unwrap();
+            let integer = n.is_integer();
+            let want_i64 = integer.then(|| text.parse::<i64>().ok()).flatten();
+            let want_u64 = match text.strip_prefix('-') {
+                Some("0") => Some(0),
+                Some(_) => None,
+                None => integer.then(|| text.parse::<u64>().ok()).flatten(),
+            };
+            assert_eq!(n.as_i64(), want_i64, "{text}");
+            assert_eq!(n.as_u64(), want_u64, "{text}");
+        }
+    }
 
     fn f(x: f64) -> String {
         format_f64(x).unwrap_or_default()
@@ -390,7 +730,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_integer_writers_match_core_formatting() {
+        let mut out = String::new();
+        for n in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            12_345,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            out.clear();
+            write_u64(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [0i64, -1, 1, i64::MIN, i64::MAX, -1_000_000] {
+            out.clear();
+            write_i64(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [
+            0u128,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) + 1,
+            u128::MAX,
+        ] {
+            out.clear();
+            write_u128(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        for n in [i128::MIN, i128::MAX, -1, 0] {
+            out.clear();
+            write_i128(&mut out, n);
+            assert_eq!(out, alloc::format!("{n}"));
+        }
+        assert_eq!(Number::from(isize::MIN).as_i64(), Some(isize::MIN as i64));
+        assert_eq!(Number::from(usize::MAX).as_u64(), Some(usize::MAX as u64));
+    }
+
+    #[test]
+    fn test_whole_value_edges() {
+        let n = |t: &'static str| Number::from_text(t).unwrap_or_else(|| Number::from(0));
+        assert_eq!(n("0").whole_value(), Some(0));
+        assert_eq!(n("-0.000e5").whole_value(), Some(0));
+        assert_eq!(n("1e-0").whole_value(), Some(1));
+        assert_eq!(n("1E+3").whole_value(), Some(1000));
+        assert_eq!(n("10e-1").whole_value(), Some(1));
+        assert_eq!(n("1e-1").whole_value(), None);
+        assert_eq!(n("1e99999999999999999999").whole_value(), None);
+        assert_eq!(n("1e-99999999999999999999").whole_value(), None);
+        assert_eq!(n("0e99999999999999999999").whole_value(), Some(0));
+        assert_eq!(
+            n("-170141183460469231731687303715884105728").whole_value(),
+            Some(i128::MIN)
+        );
+        assert_eq!(
+            n("170141183460469231731687303715884105728").whole_value(),
+            None
+        );
+        assert_eq!(
+            n("1.7014118346046923173168730371588410572e38").whole_value(),
+            Some(170_141_183_460_469_231_731_687_303_715_884_105_720)
+        );
+        assert_eq!(n("1.23e2").whole_value(), Some(123));
+    }
+
+    #[test]
+    fn test_wide_and_narrow_conversions() {
+        let n = |t: &'static str| Number::from_text(t).unwrap_or_else(|| Number::from(0));
+        assert_eq!(n("170141183460469231731687303715884105728").as_i128(), None);
+        assert_eq!(n("2.5").as_u128(), None);
+        assert_eq!(n("2.5").as_i128(), None);
+        assert_eq!(n("12").as_u128(), Some(12));
+        assert_eq!(n("-3").as_f32(), Some(-3.0));
+        // The same text rounds to f32 directly: no double rounding.
+        assert_eq!(n("16777217").as_f32(), Some(16_777_216.0));
+    }
+
+    #[test]
+    fn test_f32_is_shortest_for_f32() {
+        let mut out = String::new();
+        assert!(write_f32(&mut out, 0.1));
+        assert_eq!(out, "0.1");
+        out.clear();
+        assert!(write_f32(&mut out, 1.0e20));
+        assert_eq!(out, "1e20");
+        assert!(!write_f32(&mut out, f32::NAN));
+        assert!(!write_f64(&mut out, f64::INFINITY));
+    }
+
     proptest! {
+        #[test]
+        fn prop_f32_text_round_trips(bits in any::<u32>()) {
+            let x = f32::from_bits(bits);
+            prop_assume!(x.is_finite());
+            let mut out = String::new();
+            prop_assert!(write_f32(&mut out, x));
+            prop_assert!(lexer::is_number(&out), "{}", out);
+            prop_assert_eq!(out.parse::<f32>().map(f32::to_bits).ok(), Some(x.to_bits()));
+        }
+
+        /// Every spelling of an integer reads back as the integer.
+        #[test]
+        fn prop_whole_value_of_any_spelling(n in any::<i64>(), shift in 0usize..20, zeros in 0usize..4) {
+            let plain = alloc::format!("{n}");
+            prop_assert_eq!(Number::from_text(&plain).and_then(|x| x.whole_value()), Some(i128::from(n)));
+            // n * 10^shift written as n followed by `zeros` zeros and an exponent.
+            let spelled = alloc::format!("{n}{}e{}", "0".repeat(zeros), shift as i64 - zeros as i64);
+            let want = i128::from(n).checked_mul(10i128.pow(shift as u32));
+            prop_assert_eq!(Number::from_text(&spelled).and_then(|x| x.whole_value()), want);
+            let fraction = alloc::format!("{n}.{}", "0".repeat(zeros + 1));
+            prop_assert_eq!(Number::from_text(&fraction).and_then(|x| x.whole_value()), Some(i128::from(n)));
+        }
+
+        #[test]
+        fn prop_integer_writers_match_core(n in any::<i128>()) {
+            let mut out = String::new();
+            write_i128(&mut out, n);
+            prop_assert_eq!(out, alloc::format!("{n}"));
+        }
+
         #[test]
         fn prop_f64_text_is_valid_and_round_trips(bits in any::<u64>()) {
             let x = f64::from_bits(bits);

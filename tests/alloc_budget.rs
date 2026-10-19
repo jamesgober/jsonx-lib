@@ -68,7 +68,7 @@ fn kind<T>(r: &Result<T, jsonx_lib::Error>) -> Option<ErrorKind> {
 }
 
 #[test]
-fn budgets_refuse_before_allocating() {
+fn test_budgets_hostile_input_refused_before_allocating() {
     let tight = Parser::new().limits(
         Limits::new()
             .with_max_string_bytes(1024)
@@ -119,9 +119,152 @@ fn budgets_refuse_before_allocating() {
         body.len()
     );
 
+    // Deduplicating (`First`/`Last`) sizes the object exactly: one
+    // allocation of the kept members, never grown.
+    let mut dup = String::from("{");
+    for i in 0..64 {
+        dup.push_str(&format!("\"k{i}\":{i},"));
+    }
+    dup.push_str("\"k0\":0}");
+    for policy in [
+        jsonx_lib::DuplicateKeys::First,
+        jsonx_lib::DuplicateKeys::Last,
+    ] {
+        let p = Parser::new().duplicate_keys(policy);
+        let (r, peak) = peak_during(|| {
+            p.parse(&dup)
+                .map(|v| v.as_object().map(|o| (o.len(), o.as_slice().len())))
+        });
+        assert_eq!(r.ok().flatten(), Some((64, 64)));
+        let member = std::mem::size_of::<(std::borrow::Cow<str>, jsonx_lib::Value)>();
+        let value = std::mem::size_of::<jsonx_lib::Value>();
+        // The stacks plus one exactly sized member vector; growing it would
+        // have held a second, smaller one too.
+        assert!(
+            peak <= 128 * value + 128 * 24 + 64 * member + 4096,
+            "{policy:?}: {peak}"
+        );
+    }
+
+    // JX-SEC-01: under the default budgets no shape of document makes a
+    // parse hold more than `max_memory` (64 MiB), counting the moment a
+    // stack moves to a bigger buffer. 0.2 reached 256 MiB on 8 MiB of input.
+    let defaults = Parser::new();
+    let max = Limits::new().max_memory;
+    let flat = format!("[{}0]", "0,".repeat(4 << 20));
+    let nested = format!("{{\"a\":{flat}}}");
+    let pairs = format!("[{}[0]]", "[0],".repeat(2 << 20));
+    let members = format!("[{}{{}}]", "{\"\":0},".repeat(1 << 20));
+    let escapes = format!("[{}\"\"]", "\"\\n\",".repeat(4 << 20));
+    for (name, doc) in [
+        ("flat", &flat),
+        ("nested", &nested),
+        ("pairs", &pairs),
+        ("members", &members),
+        ("escapes", &escapes),
+    ] {
+        let (r, peak) = peak_during(|| defaults.parse(doc).map(|v| v.is_null()));
+        assert!(r.is_err(), "{name} should be over a budget");
+        assert!(peak <= max + (1 << 20), "{name}: {} MiB", peak >> 20);
+    }
+    // The memory budget itself: a tight one refuses before it is passed.
+    let tight = Parser::new().limits(Limits::unlimited().with_max_memory(1 << 20));
+    for doc in [&flat, &pairs, &members] {
+        let (r, peak) = peak_during(|| tight.parse(doc).map(|v| v.is_null()));
+        assert_eq!(kind(&r), Some(ErrorKind::MemoryLimitExceeded));
+        assert!(peak <= (1 << 20) + 4096, "tight: {peak}");
+    }
+    // An array at the top takes the stack in place: one buffer, not two.
+    let ok = format!("[{}0]", "0,".repeat(100_000));
+    let (r, peak) = peak_during(|| defaults.parse(&ok).map(|v| v.as_array().map(|a| a.len())));
+    assert_eq!(r.ok().flatten(), Some(100_001));
+    let value = std::mem::size_of::<jsonx_lib::Value>();
+    assert!(peak <= 2 * 131_072 * value, "root array: {peak}");
+
     // A string without escapes is borrowed: parsing it allocates nothing.
     let borrowed = format!("\"{}\"", "b".repeat(1000));
     let (r, peak) = peak_during(|| tight.parse(&borrowed).map(|v| v.as_str().map(str::len)));
     assert_eq!(r.ok().flatten(), Some(1000));
     assert_eq!(peak, 0, "borrowed string");
+
+    // Typed reads share the same budget (verification JX2-SEC-02: under 0.5's
+    // first build, `BTreeMap<&str, Value>` held 148 MiB from 9.9 MiB).
+    let mut map = String::from("{");
+    for i in 0..200_000 {
+        map.push_str(&format!("\"k{i}\":[],"));
+    }
+    map.push_str("\"end\":[]}");
+    let strings = format!("[{}\"\"]", "\"ab\",".repeat(200_000));
+    let values = format!("[{}[]]", "[],".repeat(200_000));
+    let one_mib = 1 << 20;
+    let tight = Parser::new().limits(Limits::new().with_max_memory(one_mib));
+    type Decode<'a> = Box<dyn Fn() -> Result<usize, jsonx_lib::DecodeError> + 'a>;
+    let typed: [(&str, Decode<'_>); 5] = [
+        (
+            "BTreeMap<&str, Value>",
+            Box::new(|| {
+                tight
+                    .decode::<std::collections::BTreeMap<&str, jsonx_lib::Value>>(&map)
+                    .map(|m| m.len())
+            }),
+        ),
+        (
+            "BTreeMap<String, Vec<u8>>",
+            Box::new(|| {
+                tight
+                    .decode::<std::collections::BTreeMap<String, Vec<u8>>>(&map)
+                    .map(|m| m.len())
+            }),
+        ),
+        (
+            "Vec<String>",
+            Box::new(|| tight.decode::<Vec<String>>(&strings).map(|v| v.len())),
+        ),
+        (
+            "Vec<Value>",
+            Box::new(|| {
+                tight
+                    .decode::<Vec<jsonx_lib::Value>>(&values)
+                    .map(|v| v.len())
+            }),
+        ),
+        (
+            "Vec<Box<Vec<u8>>>",
+            Box::new(|| tight.decode::<Vec<Box<Vec<u8>>>>(&values).map(|v| v.len())),
+        ),
+    ];
+    for (name, decode) in typed {
+        let (r, peak) = peak_during(decode);
+        let err = r.err().map(|e| e.kind().clone());
+        assert_eq!(
+            err,
+            Some(jsonx_lib::DecodeErrorKind::Syntax(
+                ErrorKind::MemoryLimitExceeded
+            )),
+            "{name}"
+        );
+        // The estimates for tree and hash collections are rough: within a
+        // small multiple of the budget, not hundreds of times the input.
+        assert!(peak <= 3 * one_mib, "{name}: {peak} bytes");
+    }
+    // Within the budget, the same reads succeed.
+    let loose = Parser::new();
+    assert_eq!(
+        loose.decode::<Vec<String>>(&strings).map(|v| v.len()).ok(),
+        Some(200_001)
+    );
+    // A stream reader's typed reads use its budget too.
+    let mut stream = tight.stream_reader();
+    assert!(stream.feed(strings.as_bytes()).is_ok());
+    stream.end_input();
+    let err = stream
+        .decode::<Vec<String>>()
+        .err()
+        .map(|e| e.kind().clone());
+    assert_eq!(
+        err,
+        Some(jsonx_lib::DecodeErrorKind::Syntax(
+            ErrorKind::MemoryLimitExceeded
+        ))
+    );
 }
