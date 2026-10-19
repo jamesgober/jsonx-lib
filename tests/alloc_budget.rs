@@ -119,6 +119,33 @@ fn budgets_refuse_before_allocating() {
         body.len()
     );
 
+    // Deduplicating (`First`/`Last`) sizes the object exactly: one
+    // allocation of the kept members, never grown.
+    let mut dup = String::from("{");
+    for i in 0..64 {
+        dup.push_str(&format!("\"k{i}\":{i},"));
+    }
+    dup.push_str("\"k0\":0}");
+    for policy in [
+        jsonx_lib::DuplicateKeys::First,
+        jsonx_lib::DuplicateKeys::Last,
+    ] {
+        let p = Parser::new().duplicate_keys(policy);
+        let (r, peak) = peak_during(|| {
+            p.parse(&dup)
+                .map(|v| v.as_object().map(|o| (o.len(), o.as_slice().len())))
+        });
+        assert_eq!(r.ok().flatten(), Some((64, 64)));
+        let member = std::mem::size_of::<(std::borrow::Cow<str>, jsonx_lib::Value)>();
+        let value = std::mem::size_of::<jsonx_lib::Value>();
+        // The stacks plus one exactly sized member vector; growing it would
+        // have held a second, smaller one too.
+        assert!(
+            peak <= 128 * value + 128 * 24 + 64 * member + 4096,
+            "{policy:?}: {peak}"
+        );
+    }
+
     // A string without escapes is borrowed: parsing it allocates nothing.
     let borrowed = format!("\"{}\"", "b".repeat(1000));
     let (r, peak) = peak_during(|| tight.parse(&borrowed).map(|v| v.as_str().map(str::len)));

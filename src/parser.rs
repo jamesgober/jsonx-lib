@@ -369,10 +369,16 @@ fn close_object<'a>(
     }
     let pairs = keys.drain(frame.keys..).zip(values.drain(frame.values..));
     let members: Vec<Member<'a>> = if dedupe {
-        pairs
-            .zip(scratch.keep.iter())
-            .filter_map(|(member, &keep)| keep.then_some(member))
-            .collect()
+        // Sized exactly up front: a filtered iterator's size is unknown, and
+        // collecting it would grow the vector by reallocation.
+        let kept = scratch.keep.iter().filter(|&&keep| keep).count();
+        let mut members = Vec::with_capacity(kept);
+        members.extend(
+            pairs
+                .zip(scratch.keep.iter())
+                .filter_map(|(member, &keep)| keep.then_some(member)),
+        );
+        members
     } else {
         pairs.collect()
     };
