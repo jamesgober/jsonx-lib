@@ -3,8 +3,8 @@
 //! [`Machine`] holds everything a reader knows about where it is in a
 //! document (the grammar state, the open containers, the budgets spent) but
 //! not the text: every step is handed the text to read. [`Reader`](crate::Reader)
-//! hands it the whole document; a reader over input that arrives in pieces
-//! hands it whatever has arrived so far. One machine, so every reader accepts
+//! hands it the whole document; [`StreamReader`](crate::StreamReader) hands
+//! it whatever has arrived so far. One machine, so both readers accept
 //! exactly the same documents with exactly the same errors and offsets.
 //!
 //! Over a complete document, running off the end is
@@ -19,7 +19,7 @@
 use alloc::{borrow::Cow, vec::Vec};
 
 use crate::{
-    DuplicateKeys, Limits, Number,
+    DuplicateKeys, Kind, Limits, Number,
     error::{Error, ErrorKind},
     lexer::{self, NumScan, StrScan},
     reader::Event,
@@ -137,6 +137,64 @@ impl Machine {
         self.state = State::Done;
     }
 
+    /// The first byte the machine may still need: the start of a token in
+    /// progress, or the current position.
+    pub(crate) fn needed_from(&self) -> usize {
+        match self.pending {
+            Pending::None => self.pos,
+            Pending::Str { quote, .. }
+            | Pending::Key { quote, .. }
+            | Pending::Colon { quote, .. } => quote,
+            Pending::Num { start, .. } | Pending::Literal { start } => start,
+        }
+    }
+
+    /// Shifts every stored offset `by` bytes towards the start, after the
+    /// first `by` bytes of the text were dropped. `by` is at most
+    /// [`needed_from`](Self::needed_from). An event that began in the
+    /// dropped part reads as beginning at 0; the stream reader keeps its own
+    /// absolute copy of that offset.
+    pub(crate) fn rebase(&mut self, by: usize) {
+        self.pos -= by;
+        self.last = self.last.saturating_sub(by);
+        self.pending = match self.pending {
+            Pending::None => Pending::None,
+            Pending::Str { quote, scan } => Pending::Str {
+                quote: quote - by,
+                scan: StrScan {
+                    next: scan.next - by,
+                    escaped: scan.escaped,
+                },
+            },
+            Pending::Key { quote, scan } => Pending::Key {
+                quote: quote - by,
+                scan: StrScan {
+                    next: scan.next - by,
+                    escaped: scan.escaped,
+                },
+            },
+            Pending::Colon {
+                quote,
+                end,
+                escaped,
+                from,
+            } => Pending::Colon {
+                quote: quote - by,
+                end: end - by,
+                escaped,
+                from: from - by,
+            },
+            Pending::Num { start, mut scan } => {
+                scan.rebase(by);
+                Pending::Num {
+                    start: start - by,
+                    scan,
+                }
+            }
+            Pending::Literal { start } => Pending::Literal { start: start - by },
+        };
+    }
+
     #[inline]
     fn end_error(src: &str) -> Error {
         Error::new(ErrorKind::UnexpectedEnd, src.len())
@@ -187,6 +245,28 @@ impl Machine {
                 _ => false,
             },
             _ => false,
+        })
+    }
+
+    /// The kind of the value that starts at the current position, if a
+    /// value starts there. Call after [`at_value`](Self::at_value) said one
+    /// comes next.
+    pub(crate) fn peek_kind(&self, src: &str) -> Option<Kind> {
+        let at = match self.pending {
+            Pending::Str { .. } => return Some(Kind::String),
+            Pending::Num { .. } => return Some(Kind::Number),
+            Pending::Literal { start } => start,
+            Pending::Key { .. } | Pending::Colon { .. } => return None,
+            Pending::None => self.pos,
+        };
+        Some(match src.as_bytes().get(at)? {
+            b'{' => Kind::Object,
+            b'[' => Kind::Array,
+            b'"' => Kind::String,
+            b'-' | b'0'..=b'9' => Kind::Number,
+            b't' | b'f' => Kind::Bool,
+            b'n' => Kind::Null,
+            _ => return None,
         })
     }
 
@@ -538,5 +618,84 @@ mod tests {
                 assert_eq!(chunked(doc, chunk), want, "{doc:?} in chunks of {chunk}");
             }
         }
+    }
+
+    #[test]
+    fn test_peek_kind_and_at_value() {
+        let src = r#"[{"a": 1}, "s", 2, true, null, []]"#;
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, true);
+        assert_eq!(m.at_value(src), Ok(true));
+        assert_eq!(m.peek_kind(src), Some(Kind::Array));
+        assert!(m.step(src).is_ok());
+        let mut kinds = Vec::new();
+        while m.at_value(src) == Ok(true) {
+            kinds.push(m.peek_kind(src));
+            // Skip the value: a container takes two events here.
+            let depth = m.depth();
+            let _first = m.step(src);
+            while m.depth() > depth {
+                let _inner = m.step(src);
+            }
+        }
+        assert_eq!(
+            kinds,
+            [
+                Some(Kind::Object),
+                Some(Kind::String),
+                Some(Kind::Number),
+                Some(Kind::Bool),
+                Some(Kind::Null),
+                Some(Kind::Array)
+            ]
+        );
+        assert_eq!(m.peek_kind("x"), None);
+    }
+
+    #[test]
+    fn test_pending_tokens_report_their_kind_and_rebase() {
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, false);
+        let src = "   [\"abc";
+        assert!(m.step(src).is_ok()); // [
+        assert!(m.step(src).is_err()); // the string is cut short
+        assert_eq!(m.needed_from(), 4);
+        assert_eq!(m.peek_kind(src), Some(Kind::String));
+        assert_eq!(m.at_value(src), Ok(true));
+        m.rebase(3);
+        assert_eq!(m.needed_from(), 1);
+        let rest = "[\"abcdef\"]";
+        assert_eq!(
+            m.step(rest).ok().flatten(),
+            Some(Event::String("abcdef".into()))
+        );
+        assert_eq!(m.last, 1);
+
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, false);
+        assert!(m.step("{\"k\"  ").is_ok()); // {
+        assert!(m.step("{\"k\"  ").is_err()); // waiting for the colon
+        assert_eq!(m.at_value("{\"k\"  "), Ok(false));
+        assert_eq!(m.peek_kind("{\"k\"  "), None);
+        m.rebase(1);
+        assert_eq!(
+            m.step("\"k\"  :1}").ok().flatten(),
+            Some(Event::Key("k".into()))
+        );
+
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, false);
+        assert!(m.step("[12").is_ok());
+        assert!(m.step("[12").is_err());
+        assert_eq!(m.peek_kind("[12"), Some(Kind::Number));
+        m.rebase(1);
+        assert_eq!(m.needed_from(), 0);
+        assert!(
+            m.step("12]")
+                .is_ok_and(|e| e == Some(Event::Number(12.into())))
+        );
+
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, false);
+        assert!(m.step("[tr").is_ok());
+        assert!(m.step("[tr").is_err());
+        assert_eq!(m.peek_kind("[tr"), Some(Kind::Bool));
+        m.rebase(1);
+        assert_eq!(m.step("true]").ok().flatten(), Some(Event::Bool(true)));
     }
 }

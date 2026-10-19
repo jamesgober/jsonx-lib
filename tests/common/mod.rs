@@ -13,6 +13,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod strategies;
+
 /// A parsed value, with numbers as their exact text.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RefValue {

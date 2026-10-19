@@ -156,6 +156,11 @@ pub enum ErrorKind {
     /// The document holds more values than [`Limits::max_elements`](crate::Limits::max_elements).
     /// The offset is the first byte of the value that went over.
     TooManyElements,
+    /// Bytes were fed to a [`StreamReader`](crate::StreamReader) after
+    /// [`end_input`](crate::StreamReader::end_input) said the input had
+    /// ended. A mistake in the calling code, not in the document; the
+    /// offset is the number of bytes accepted before the end.
+    InputAfterEnd,
 }
 
 impl ErrorKind {
@@ -206,6 +211,7 @@ impl ErrorKind {
             Self::StringTooLong => "string length limit exceeded",
             Self::NumberTooLong => "number length limit exceeded",
             Self::TooManyElements => "element count limit exceeded",
+            Self::InputAfterEnd => "input fed after the end of input",
         }
     }
 }
@@ -254,6 +260,7 @@ mod tests {
             ErrorKind::StringTooLong,
             ErrorKind::NumberTooLong,
             ErrorKind::TooManyElements,
+            ErrorKind::InputAfterEnd,
         ];
         let budgets = all.iter().filter(|k| k.is_budget()).count();
         assert_eq!(budgets, 5);

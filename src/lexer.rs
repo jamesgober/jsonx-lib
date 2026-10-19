@@ -254,6 +254,12 @@ impl NumScan {
             state: NumState::Start,
         }
     }
+
+    /// Moves the scan's position `by` bytes towards the start of the input.
+    #[inline]
+    pub(crate) const fn rebase(&mut self, by: usize) {
+        self.next -= by;
+    }
 }
 
 /// The states of the RFC 8259 number grammar,
@@ -595,6 +601,9 @@ mod tests {
             kind_at(resume_number(b"1234", 0, &mut scan, false, 3)),
             (ErrorKind::NumberTooLong, 0)
         );
+        let mut scan = NumScan::start(4);
+        scan.rebase(4);
+        assert_eq!(resume_number(b"5 ", 0, &mut scan, false, 3).ok(), Some(1));
     }
 
     #[test]

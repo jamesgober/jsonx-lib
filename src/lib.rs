@@ -85,6 +85,7 @@ mod object;
 mod parser;
 mod reader;
 mod scan;
+mod stream;
 mod tree;
 mod value;
 mod write;
@@ -96,6 +97,7 @@ pub use number::Number;
 pub use object::{Iter, IterMut, Object};
 pub use parser::{DuplicateKeys, Parser};
 pub use reader::{Event, Reader};
+pub use stream::{Step, StreamReader};
 pub use value::{Kind, Value};
 pub use write::{to_string, to_string_pretty, write_string, write_value, write_value_pretty};
 #[cfg(feature = "std")]

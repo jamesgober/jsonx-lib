@@ -4,7 +4,7 @@ use alloc::borrow::Cow;
 use core::iter::FusedIterator;
 
 use crate::{
-    DuplicateKeys, Limits, Number, Value,
+    DuplicateKeys, Kind, Limits, Number, Value,
     error::{Error, ErrorKind},
     machine::Machine,
     parser,
@@ -244,6 +244,44 @@ impl<'a> Reader<'a> {
         parser::build(self, duplicates)
             .inspect_err(|&e| self.failed = Some(e))
             .map(Some)
+    }
+
+    /// The kind of the next value, without consuming anything: `None` when
+    /// no value comes next (positioning as for [`read_raw`](Self::read_raw)),
+    /// or when the next byte cannot start one (the next
+    /// [`next_event`](Self::next_event) reports why). Decided by the value's
+    /// first byte alone, so `tru` peeks as [`Kind::Bool`].
+    ///
+    /// Useful for a value that may be one of several shapes, such as LSP's
+    /// `string | number` ids.
+    ///
+    /// # Errors
+    ///
+    /// Any error the reader already stopped at.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Kind, Reader};
+    ///
+    /// let mut r = Reader::new(r#"[7, "seven"]"#);
+    /// r.next_event()?;
+    /// assert_eq!(r.peek_kind()?, Some(Kind::Number));
+    /// r.read_raw()?;
+    /// assert_eq!(r.peek_kind()?, Some(Kind::String));
+    /// r.read_raw()?;
+    /// assert_eq!(r.peek_kind()?, None); // the array ends
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    pub fn peek_kind(&mut self) -> Result<Option<Kind>, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        Ok(if self.machine.at_value(self.src)? {
+            self.machine.peek_kind(self.src)
+        } else {
+            None
+        })
     }
 
     /// Reads to the end of the document, checking that the rest of it is
