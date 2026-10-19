@@ -383,6 +383,33 @@ pub(crate) fn emit<E>(
     flush_at: usize,
     flush: &mut dyn FnMut(&mut String) -> Result<(), E>,
 ) -> Result<(), E> {
+    // One copy of the loop per layout, so the common one (compact, plainly
+    // escaped) tests neither per value.
+    match (format.pretty, format.strict()) {
+        (false, false) => emit_as::<E, false, false>(out, value, format, base, flush_at, flush),
+        (false, true) => emit_as::<E, false, true>(out, value, format, base, flush_at, flush),
+        (true, false) => emit_as::<E, true, false>(out, value, format, base, flush_at, flush),
+        (true, true) => emit_as::<E, true, true>(out, value, format, base, flush_at, flush),
+    }
+}
+
+/// [`emit`] for one layout: `PRETTY` is `format.pretty`, `STRICT` is
+/// `format.strict()`.
+fn emit_as<E, const PRETTY: bool, const STRICT: bool>(
+    out: &mut String,
+    value: &Value<'_>,
+    format: Format,
+    base: usize,
+    flush_at: usize,
+    flush: &mut dyn FnMut(&mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    let write_text = |out: &mut String, text: &str| {
+        if STRICT {
+            write_string_strict(out, text, format);
+        } else {
+            write_string(out, text);
+        }
+    };
     let mut stack: alloc::vec::Vec<(Open<'_, '_>, bool)> = alloc::vec::Vec::new();
     let mut next = Some(value);
     loop {
@@ -392,7 +419,7 @@ pub(crate) fn emit<E>(
                 Value::Bool(true) => out.push_str("true"),
                 Value::Bool(false) => out.push_str("false"),
                 Value::Number(n) => out.push_str(n.as_str()),
-                Value::String(s) => write_str(out, s, format),
+                Value::String(s) => write_text(out, s),
                 Value::Array(a) if a.is_empty() => out.push_str("[]"),
                 Value::Object(o) if o.is_empty() => out.push_str("{}"),
                 Value::Array(a) => {
@@ -426,7 +453,7 @@ pub(crate) fn emit<E>(
                 '}'
             };
             let _closed = stack.pop();
-            if format.pretty {
+            if PRETTY {
                 newline(out, base + depth - 1, format);
             }
             out.push(close);
@@ -436,12 +463,12 @@ pub(crate) fn emit<E>(
             out.push(',');
         }
         *first = false;
-        if format.pretty {
+        if PRETTY {
             newline(out, base + depth, format);
         }
         if let Some(key) = key {
-            write_str(out, key, format);
-            out.push_str(if format.pretty { ": " } else { ":" });
+            write_text(out, key);
+            out.push_str(if PRETTY { ": " } else { ":" });
         }
         next = Some(child);
     }
