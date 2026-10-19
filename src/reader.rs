@@ -343,17 +343,27 @@ impl<'a> Reader<'a> {
     /// [`Value::pointer`](crate::Value::pointer) would find, without the
     /// tree. Everything before the target is read and validated; members and
     /// items that are not on the way are skipped with
-    /// [`read_raw`](Self::read_raw). The reader stops just past the target:
-    /// the rest of the document is not read, so call
-    /// [`finish`](Self::finish) to check it too.
+    /// [`read_raw`](Self::read_raw).
+    ///
+    /// **Duplicate keys.** Under [`DuplicateKeys::Error`], the default, the
+    /// answer is given only for a value with no repeated key anywhere in it:
+    /// the reader reads the rest of the value it started on before
+    /// returning (and, started at the top of a document, the rest of the
+    /// document, as [`finish`](Self::finish) does), so
+    /// `{"method": "a", "method": "b"}` is refused, as by
+    /// [`parse`](crate::parse), rather than answered with either member. The
+    /// reader then stands past that value. Under the other policies it stops
+    /// just past the target, without reading the rest, and in an object the
+    /// first member with the key is the one taken.
     ///
     /// `Ok(None)` when the pointer is malformed or names nothing (as
-    /// `Value::pointer`'s `None`); in an object, the first member with the
-    /// key is the one taken.
+    /// `Value::pointer`'s `None`).
     ///
     /// # Errors
     ///
-    /// Any error of the reader on the way to the target, or inside it.
+    /// Any error of the reader on the way to the target, or inside it, and
+    /// under `DuplicateKeys::Error` in the rest of the value (a repeated key
+    /// included).
     ///
     /// # Examples
     ///
@@ -364,9 +374,31 @@ impl<'a> Reader<'a> {
     /// assert_eq!(Reader::new(message).find_pointer("/params/items/1/label")?, Some(r#""b""#));
     /// assert_eq!(Reader::new(message).find_pointer("/id")?, Some("9"));
     /// assert_eq!(Reader::new(message).find_pointer("/params/missing")?, None);
+    ///
+    /// // A repeated key anywhere is refused, as `parse` refuses it.
+    /// let smuggled = r#"{"method": "initialize", "method": "shutdown"}"#;
+    /// assert!(Reader::new(smuggled).find_pointer("/method").is_err());
     /// # Ok::<(), jsonx_lib::Error>(())
     /// ```
     pub fn find_pointer(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
+        let depth = self.depth();
+        let found = self.find_in(pointer)?;
+        if self.machine.duplicates == DuplicateKeys::Error {
+            // The rest of the value, so that every object in it is checked.
+            while self.depth() > depth {
+                if self.next_event()?.is_none() {
+                    break;
+                }
+            }
+            if depth == 0 && !self.machine.documents {
+                self.read_to_end()?;
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`find_pointer`](Self::find_pointer) up to the target.
+    fn find_in(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
         if pointer.is_empty() {
             return self.read_raw();
         }

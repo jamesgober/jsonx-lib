@@ -365,6 +365,12 @@ proptest! {
         };
         prop_assert_eq!(streamed, parsed);
         prop_assert_eq!(jsonx_lib::Reader::new(&text).read_raw().err(), parsed);
+        // A pointer lookup answers only for a document without repeats, a
+        // member whose key repeats included.
+        for pointer in ["", "/a", "/0", "/a/a", "/b/0/a"] {
+            let found = jsonx_lib::Reader::new(&text).find_pointer(pointer);
+            prop_assert_eq!(found.err(), parsed, "{}", pointer);
+        }
         let mut incremental = jsonx_lib::StreamReader::new();
         let at = cut.index(text.len() + 1);
         let (head, tail) = text.as_bytes().split_at(at);

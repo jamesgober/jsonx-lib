@@ -516,7 +516,7 @@ error, and the iterator yields it once and then ends.
 | `fn read_object(&mut self) -> Result<ObjectReader<'_, 'a>, DecodeError>` | Starts reading an object member by member ([`ObjectReader`](#objectreader)). |
 | `fn read_array(&mut self) -> Result<ArrayReader<'_, 'a>, DecodeError>` | Starts reading an array item by item ([`ArrayReader`](#arrayreader)). |
 | `fn peek_kind(&mut self) -> Result<Option<Kind>, Error>` | The next value's kind, from its first byte, consuming nothing. |
-| `fn find_pointer(&mut self, &str) -> Result<Option<&'a str>, Error>` | The raw text of the value at a JSON Pointer, building no tree; reads only as far as the target. |
+| `fn find_pointer(&mut self, &str) -> Result<Option<&'a str>, Error>` | The raw text of the value at a JSON Pointer, building no tree. Under `DuplicateKeys::Error` (the default) it reads the rest of the value (at the top, the rest of the document) first, so a document with a repeated key anywhere is refused rather than answered; under the other policies it reads only as far as the target, taking an object's first member with the key. |
 | `fn finish(self) -> Result<(), Error>` | Reads and validates the rest of the document. |
 | `fn depth(&self)`, `fn offset(&self)`, `fn event_offset(&self)` | Containers open; bytes consumed; where the last event's token began. |
 
