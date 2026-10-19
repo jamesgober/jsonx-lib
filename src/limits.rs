@@ -2,8 +2,9 @@
 
 /// Budgets on the work and memory a document may cost.
 ///
-/// Every budget is checked before the memory it guards is allocated, so a
-/// hostile document is refused while it is still cheap to refuse. None of them
+/// Every budget is checked before the memory it guards is allocated (with
+/// the one exception noted under "What a tree costs"), so a hostile document
+/// is refused while it is still cheap to refuse. None of them
 /// is there to protect the stack: the parser, the writer, and every operation
 /// on [`Value`](crate::Value) use a bounded amount of stack whatever the
 /// nesting depth (explicit stacks on the heap; drop recurses at most a fixed
@@ -16,12 +17,34 @@
 /// | [`max_input_bytes`](Self::max_input_bytes) | 64 MiB | bytes of input |
 /// | [`max_string_bytes`](Self::max_string_bytes) | 16 MiB | source bytes between a string's quotes, keys included |
 /// | [`max_number_bytes`](Self::max_number_bytes) | 1 KiB | bytes of a number's text |
-/// | [`max_elements`](Self::max_elements) | 4 Mi | values in the document: every scalar, array, and object counts one |
+/// | [`max_elements`](Self::max_elements) | 1 Mi | values in the document: every scalar, array, and object counts one |
+/// | [`max_memory`](Self::max_memory) | 64 MiB | heap a parse holds for the tree it builds (see below) |
 ///
 /// The depth default matches `serde_json`'s recursion limit, so code moving
 /// from it sees the same behaviour. A string's budget is measured in source
 /// bytes, which is never less than its decoded length, so the check can run
 /// before the string is decoded.
+///
+/// **What a tree costs.** A parsed value holds, besides the borrowed input,
+/// `size_of::<Value>()` bytes for every value (32 on a 64-bit target), the
+/// same again for every object member's key (24 bytes for the key, so 56
+/// per member), and the decoded text of every string or key that had
+/// escapes. A compact document spends a few bytes of input per value, so the
+/// tree can be several times the input: under the defaults a hostile
+/// document can make one parse hold at most about [`max_memory`](Self::max_memory)
+/// (64 MiB), whatever its shape. That is the number to multiply by the
+/// parses that may run at once; a server taking many requests should lower
+/// it (and `max_input_bytes`) to what its messages need.
+///
+/// `max_memory` counts the buffers a parse asks for (the tree and the
+/// builder's working stacks, at their capacity), checked before a stack
+/// grows and before each array or object is allocated; a decoded string is
+/// counted once made, so a parse may hold one string budget beyond it. The
+/// allocator's own overhead is not counted. It applies wherever a tree is
+/// built ([`Parser::parse`](crate::Parser::parse), [`Reader::read_value`](crate::Reader::read_value),
+/// [`StreamReader::read_value`](crate::StreamReader::read_value), and the
+/// [`Value`](crate::Value) implementation of `FromJson`); reading events or
+/// typed values builds no tree and holds only the reader's own state.
 ///
 /// The struct is `#[non_exhaustive]`: start from [`Limits::default`] or
 /// [`Limits::unlimited`] and change the fields you care about, or chain the
@@ -58,6 +81,9 @@ pub struct Limits {
     /// The most values a document may hold, counting every scalar, array, and
     /// object (keys are not counted separately).
     pub max_elements: usize,
+    /// The most heap, in bytes, a parse may hold for the tree it builds; see
+    /// "What a tree costs" above.
+    pub max_memory: usize,
 }
 
 impl Limits {
@@ -79,7 +105,8 @@ impl Limits {
             max_input_bytes: 64 * 1024 * 1024,
             max_string_bytes: 16 * 1024 * 1024,
             max_number_bytes: 1024,
-            max_elements: 4 * 1024 * 1024,
+            max_elements: 1024 * 1024,
+            max_memory: 64 * 1024 * 1024,
         }
     }
 
@@ -103,6 +130,7 @@ impl Limits {
             max_string_bytes: usize::MAX,
             max_number_bytes: usize::MAX,
             max_elements: usize::MAX,
+            max_memory: usize::MAX,
         }
     }
 
@@ -189,6 +217,24 @@ impl Limits {
         self.max_elements = count;
         self
     }
+
+    /// Sets [`max_memory`](Self::max_memory).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{ErrorKind, Limits, Parser};
+    ///
+    /// let p = Parser::new().limits(Limits::new().with_max_memory(4096));
+    /// assert!(p.parse("[1, 2, 3]").is_ok());
+    /// let big = format!("[{}0]", "0,".repeat(1000));
+    /// assert_eq!(p.parse(&big).unwrap_err().kind(), ErrorKind::MemoryLimitExceeded);
+    /// ```
+    #[must_use]
+    pub const fn with_max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = bytes;
+        self
+    }
 }
 
 impl Default for Limits {
@@ -209,7 +255,8 @@ mod tests {
         assert_eq!(l.max_input_bytes, 64 << 20);
         assert_eq!(l.max_string_bytes, 16 << 20);
         assert_eq!(l.max_number_bytes, 1024);
-        assert_eq!(l.max_elements, 4 << 20);
+        assert_eq!(l.max_elements, 1 << 20);
+        assert_eq!(l.max_memory, 64 << 20);
     }
 
     #[test]
@@ -219,16 +266,18 @@ mod tests {
             .with_max_input_bytes(2)
             .with_max_string_bytes(3)
             .with_max_number_bytes(4)
-            .with_max_elements(5);
+            .with_max_elements(5)
+            .with_max_memory(6);
         assert_eq!(
             (
                 l.max_depth,
                 l.max_input_bytes,
                 l.max_string_bytes,
                 l.max_number_bytes,
-                l.max_elements
+                l.max_elements,
+                l.max_memory
             ),
-            (1, 2, 3, 4, 5)
+            (1, 2, 3, 4, 5, 6)
         );
     }
 }

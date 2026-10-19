@@ -286,7 +286,8 @@ impl<'a> Reader<'a> {
             return Ok(None);
         }
         let duplicates = self.machine.duplicates;
-        parser::build(self, duplicates)
+        let max_memory = self.machine.limits.max_memory;
+        parser::build(self, duplicates, max_memory)
             .inspect_err(|&e| self.failed = Some(e))
             .map(Some)
     }

@@ -499,10 +499,11 @@ impl StreamReader {
             .get(start - self.base..end - self.base)
             .unwrap_or("");
         // The budgets, and duplicates under `DuplicateKeys::Error`, were
-        // checked while the value was skipped; only `First` and `Last`
-        // remain to apply.
+        // checked while the value was skipped; the memory budget, and
+        // `First` and `Last`, remain to apply to the tree.
+        let limits = Limits::unlimited().with_max_memory(self.machine.limits.max_memory);
         let parser = Parser::new()
-            .limits(Limits::unlimited())
+            .limits(limits)
             .duplicate_keys(self.machine.duplicates);
         match parser.parse(text) {
             Ok(value) => Ok(Step::Ready(Some(value))),

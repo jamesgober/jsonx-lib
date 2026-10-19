@@ -1,6 +1,7 @@
 //! The configured parser and the tree builder.
 
 use alloc::{borrow::Cow, vec::Vec};
+use core::mem::size_of;
 
 use crate::{
     Array, Limits, Object, Reader, Value, dupes,
@@ -269,11 +270,51 @@ impl Parser {
 }
 
 /// An open container in the builder: where its children start on the shared
-/// value and key stacks.
+/// value and key stacks, and where it starts in the input.
 #[derive(Clone, Copy)]
 struct Frame {
     values: usize,
     keys: usize,
+    start: usize,
+}
+
+/// The heap a build holds, against [`Limits::max_memory`].
+struct Budget {
+    max: usize,
+    /// The finished arrays and objects, and decoded strings.
+    held: usize,
+}
+
+impl Budget {
+    /// Refuses the value at `at` if `extra` more bytes, on top of what is
+    /// held and the stacks' `stacks` bytes, would pass the budget.
+    #[inline]
+    fn allow(&self, stacks: usize, extra: usize, at: usize) -> Result<(), Error> {
+        if self.held.saturating_add(stacks).saturating_add(extra) > self.max {
+            Err(Error::new(ErrorKind::MemoryLimitExceeded, at))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The bytes the builder's stacks hold, at their capacity.
+#[inline]
+fn stacks(values: &Vec<Value<'_>>, keys: &Vec<Cow<'_, str>>) -> usize {
+    values.capacity() * size_of::<Value<'_>>() + keys.capacity() * size_of::<Cow<'_, str>>()
+}
+
+/// The bytes one more push onto `v` would allocate: none while it has room,
+/// otherwise its whole new buffer (vectors double, from four). The old
+/// buffer is still counted in [`stacks`] until the move, so the check covers
+/// the moment both exist.
+#[inline]
+fn growth<T>(v: &Vec<T>) -> usize {
+    if v.len() < v.capacity() {
+        0
+    } else {
+        (v.capacity() * 2).max(4) * size_of::<T>()
+    }
 }
 
 /// Buffers reused by every object's duplicate check in one build.
@@ -287,43 +328,69 @@ struct Scratch {
 ///
 /// Children of every open container sit on one shared value stack; when a
 /// container closes, its children are moved off the top into a vector of
-/// exactly their size. Nothing recurses, and no container's vector ever grows
-/// by reallocation.
+/// exactly their size, except the outermost array, which takes the stack
+/// itself. Nothing recurses, and no container's vector ever grows by
+/// reallocation. What the build holds is charged against `max_memory`
+/// before it is allocated (see [`Limits`]).
 pub(crate) fn build<'a>(
     reader: &mut Reader<'a>,
     policy: DuplicateKeys,
+    max_memory: usize,
 ) -> Result<Value<'a>, Error> {
     let mut values: Vec<Value<'a>> = Vec::new();
     let mut keys: Vec<Cow<'a, str>> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
     let mut scratch = Scratch::default();
+    let mut budget = Budget {
+        max: max_memory,
+        held: 0,
+    };
     loop {
         let Some(event) = reader.next_event()? else {
             // The reader ends a document only after a complete value.
             return Err(Error::new(ErrorKind::UnexpectedEnd, reader.offset()));
         };
+        let at = reader.event_offset();
         let value = match event {
             Event::StartArray | Event::StartObject => {
                 frames.push(Frame {
                     values: values.len(),
                     keys: keys.len(),
+                    start: at,
                 });
                 continue;
             }
             Event::Key(key) => {
+                budget.allow(stacks(&values, &keys), growth(&keys), at)?;
+                if let Cow::Owned(decoded) = &key {
+                    budget.held += decoded.capacity();
+                }
                 keys.push(key);
                 continue;
             }
             Event::EndArray => {
                 let Some(frame) = frames.pop() else {
-                    return Err(Error::new(ErrorKind::ExpectedValue, reader.event_offset()));
+                    return Err(Error::new(ErrorKind::ExpectedValue, at));
                 };
+                if frames.is_empty() && frame.values == 0 {
+                    // The outermost array: its items are the whole stack,
+                    // which becomes the array in place, already counted.
+                    let mut items = core::mem::take(&mut values);
+                    items.shrink_to_fit();
+                    return Ok(Value::Array(Array::from(items)));
+                }
+                let bytes = (values.len() - frame.values) * size_of::<Value<'a>>();
+                budget.allow(stacks(&values, &keys), bytes, frame.start)?;
+                budget.held += bytes;
                 Value::Array(Array::from(values.split_off(frame.values)))
             }
             Event::EndObject => {
                 let Some(frame) = frames.pop() else {
-                    return Err(Error::new(ErrorKind::ExpectedValue, reader.event_offset()));
+                    return Err(Error::new(ErrorKind::ExpectedValue, at));
                 };
+                let bytes = (keys.len() - frame.keys) * size_of::<Member<'a>>();
+                budget.allow(stacks(&values, &keys), bytes, frame.start)?;
+                budget.held += bytes;
                 Value::Object(close_object(
                     &mut values,
                     &mut keys,
@@ -332,7 +399,13 @@ pub(crate) fn build<'a>(
                     &mut scratch,
                 ))
             }
-            Event::String(s) => Value::String(s),
+            Event::String(s) => {
+                if let Cow::Owned(decoded) = &s {
+                    budget.held += decoded.capacity();
+                    budget.allow(stacks(&values, &keys), 0, at)?;
+                }
+                Value::String(s)
+            }
             Event::Number(n) => Value::Number(n),
             Event::Bool(b) => Value::Bool(b),
             Event::Null => Value::Null,
@@ -340,6 +413,11 @@ pub(crate) fn build<'a>(
         if frames.is_empty() {
             return Ok(value);
         }
+        let start = match &value {
+            Value::Array(_) | Value::Object(_) => reader.event_offset(),
+            _ => at,
+        };
+        budget.allow(stacks(&values, &keys), growth(&values), start)?;
         values.push(value);
     }
 }

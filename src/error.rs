@@ -156,6 +156,10 @@ pub enum ErrorKind {
     /// The document holds more values than [`Limits::max_elements`](crate::Limits::max_elements).
     /// The offset is the first byte of the value that went over.
     TooManyElements,
+    /// Building the document's tree would hold more memory than
+    /// [`Limits::max_memory`](crate::Limits::max_memory). The offset is the
+    /// first byte of the value whose storage went over.
+    MemoryLimitExceeded,
     /// Bytes were fed to a [`StreamReader`](crate::StreamReader) after
     /// [`end_input`](crate::StreamReader::end_input) said the input had
     /// ended. A mistake in the calling code, not in the document; the
@@ -185,6 +189,7 @@ impl ErrorKind {
                 | Self::StringTooLong
                 | Self::NumberTooLong
                 | Self::TooManyElements
+                | Self::MemoryLimitExceeded
         )
     }
 
@@ -211,6 +216,7 @@ impl ErrorKind {
             Self::StringTooLong => "string length limit exceeded",
             Self::NumberTooLong => "number length limit exceeded",
             Self::TooManyElements => "element count limit exceeded",
+            Self::MemoryLimitExceeded => "memory limit exceeded",
             Self::InputAfterEnd => "input fed after the end of input",
         }
     }
@@ -260,10 +266,11 @@ mod tests {
             ErrorKind::StringTooLong,
             ErrorKind::NumberTooLong,
             ErrorKind::TooManyElements,
+            ErrorKind::MemoryLimitExceeded,
             ErrorKind::InputAfterEnd,
         ];
         let budgets = all.iter().filter(|k| k.is_budget()).count();
-        assert_eq!(budgets, 5);
+        assert_eq!(budgets, 6);
         for kind in all {
             assert!(!kind.to_string().is_empty());
         }

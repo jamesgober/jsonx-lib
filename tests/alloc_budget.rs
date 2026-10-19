@@ -146,6 +146,41 @@ fn budgets_refuse_before_allocating() {
         );
     }
 
+    // JX-SEC-01: under the default budgets no shape of document makes a
+    // parse hold more than `max_memory` (64 MiB), counting the moment a
+    // stack moves to a bigger buffer. 0.2 reached 256 MiB on 8 MiB of input.
+    let defaults = Parser::new();
+    let max = Limits::new().max_memory;
+    let flat = format!("[{}0]", "0,".repeat(4 << 20));
+    let nested = format!("{{\"a\":{flat}}}");
+    let pairs = format!("[{}[0]]", "[0],".repeat(2 << 20));
+    let members = format!("[{}{{}}]", "{\"\":0},".repeat(1 << 20));
+    let escapes = format!("[{}\"\"]", "\"\\n\",".repeat(4 << 20));
+    for (name, doc) in [
+        ("flat", &flat),
+        ("nested", &nested),
+        ("pairs", &pairs),
+        ("members", &members),
+        ("escapes", &escapes),
+    ] {
+        let (r, peak) = peak_during(|| defaults.parse(doc).map(|v| v.is_null()));
+        assert!(r.is_err(), "{name} should be over a budget");
+        assert!(peak <= max + (1 << 20), "{name}: {} MiB", peak >> 20);
+    }
+    // The memory budget itself: a tight one refuses before it is passed.
+    let tight = Parser::new().limits(Limits::unlimited().with_max_memory(1 << 20));
+    for doc in [&flat, &pairs, &members] {
+        let (r, peak) = peak_during(|| tight.parse(doc).map(|v| v.is_null()));
+        assert_eq!(kind(&r), Some(ErrorKind::MemoryLimitExceeded));
+        assert!(peak <= (1 << 20) + 4096, "tight: {peak}");
+    }
+    // An array at the top takes the stack in place: one buffer, not two.
+    let ok = format!("[{}0]", "0,".repeat(100_000));
+    let (r, peak) = peak_during(|| defaults.parse(&ok).map(|v| v.as_array().map(|a| a.len())));
+    assert_eq!(r.ok().flatten(), Some(100_001));
+    let value = std::mem::size_of::<jsonx_lib::Value>();
+    assert!(peak <= 2 * 131_072 * value, "root array: {peak}");
+
     // A string without escapes is borrowed: parsing it allocates nothing.
     let borrowed = format!("\"{}\"", "b".repeat(1000));
     let (r, peak) = peak_during(|| tight.parse(&borrowed).map(|v| v.as_str().map(str::len)));
