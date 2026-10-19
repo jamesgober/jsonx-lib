@@ -19,8 +19,8 @@ use alloc::{
 use core::fmt;
 
 use crate::{
-    Array, DuplicateKeys, Kind, Limits, Number, Object, Parser, Reader, ToJson, Value, ValueWriter,
-    Written,
+    Array, DuplicateKeys, Kind, Limits, Number, Numbers, Object, Parser, Reader, ToJson, Value,
+    ValueWriter, Written,
     error::{Error, ErrorKind},
     reader::Event,
 };
@@ -1529,9 +1529,13 @@ macro_rules! from_json_integer {
     ($($t:ty => $via:ident),* $(,)?) => {$(
         impl<'de> FromJson<'de> for $t {
             fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
+                let lenient = reader.number_policy() == Numbers::WholeValues;
                 let (n, at) = number(reader, stringify!($t))?;
                 n.$via()
                     .and_then(|wide| <$t>::try_from(wide).ok())
+                    .or_else(|| {
+                        lenient.then(|| n.whole_value()).flatten().and_then(|w| <$t>::try_from(w).ok())
+                    })
                     .ok_or_else(|| {
                         DecodeError::new(DecodeErrorKind::OutOfRange { expected: stringify!($t) }, at)
                     })

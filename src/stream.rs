@@ -559,7 +559,8 @@ impl StreamReader {
         let limits = Limits::unlimited().with_max_depth(self.machine.limits.max_depth);
         let parser = Parser::new()
             .limits(limits)
-            .duplicate_keys(self.machine.duplicates);
+            .duplicate_keys(self.machine.duplicates)
+            .numbers(self.machine.numbers);
         parser
             .decode(text)
             .map(|value| Step::Ready(Some(value)))
@@ -863,7 +864,9 @@ impl Parser {
     /// ```
     #[must_use]
     pub fn stream_reader(&self) -> StreamReader {
-        StreamReader::with_config(self.get_limits(), self.get_duplicate_keys())
+        let mut reader = StreamReader::with_config(self.get_limits(), self.get_duplicate_keys());
+        reader.machine.numbers = self.get_numbers();
+        reader
     }
 }
 

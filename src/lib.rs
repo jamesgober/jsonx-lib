@@ -107,7 +107,7 @@ pub use format::Format;
 pub use limits::Limits;
 pub use number::Number;
 pub use object::{Entry, Iter, IterMut, Object, OccupiedEntry, VacantEntry};
-pub use parser::{DuplicateKeys, Parser};
+pub use parser::{DuplicateKeys, Numbers, Parser};
 pub use raw::RawValue;
 pub use reader::{Event, Reader};
 pub use stream::{Step, StreamReader};

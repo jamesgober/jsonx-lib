@@ -228,6 +228,88 @@ impl<'a> Number<'a> {
         }
     }
 
+    /// The number's value, if it is a whole number in `i128`'s range,
+    /// however it is written: `100`, `1e2`, `100.0`, and `1000e-1` are all
+    /// `Some(100)`, `-0.0` is `Some(0)`, and `1.5` or `1e40` are `None`. The
+    /// decimal digits and the exponent are worked exactly: nothing goes
+    /// through floating point, so nothing is rounded.
+    ///
+    /// [`as_i64`](Self::as_i64) and its siblings read integer *text* only;
+    /// this reads integer *values*, for data from writers that put whole
+    /// numbers in exponent or fraction form. See also
+    /// [`Numbers::WholeValues`](crate::Numbers::WholeValues).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let n = |s| Number::from_text(s).unwrap();
+    /// assert_eq!(n("1e2").whole_value(), Some(100));
+    /// assert_eq!(n("2.50e1").whole_value(), Some(25));
+    /// assert_eq!(n("-12.000").whole_value(), Some(-12));
+    /// assert_eq!(n("0.5e1").whole_value(), Some(5));
+    /// assert_eq!(n("1.25").whole_value(), None);
+    /// assert_eq!(n("1e39").whole_value(), None); // past i128
+    /// ```
+    #[must_use]
+    pub fn whole_value(&self) -> Option<i128> {
+        let text = self.text.as_bytes();
+        let (negative, text) = match text.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, text),
+        };
+        let (mantissa, exponent) = match text.iter().position(|&b| b == b'e' || b == b'E') {
+            Some(at) => (text.get(..at)?, text.get(at + 1..)?),
+            None => (text, &b""[..]),
+        };
+        let (int, frac) = match mantissa.iter().position(|&b| b == b'.') {
+            Some(at) => (mantissa.get(..at)?, mantissa.get(at + 1..)?),
+            None => (mantissa, &b""[..]),
+        };
+        // The exponent, saturated: anything past +-2^62 is far out of range
+        // or far below one either way.
+        let (exp_negative, exp_digits) = match exponent.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            Some((b'+', rest)) => (false, rest),
+            _ => (false, exponent),
+        };
+        let mut exp: i64 = 0;
+        for &d in exp_digits {
+            exp = exp.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+        }
+        if exp_negative {
+            exp = -exp;
+        }
+        // The significant digits, and the power of ten they are scaled by.
+        let digits = int.iter().chain(frac.iter()).copied();
+        let mut scale = exp.saturating_sub(frac.len() as i64);
+        let significant: alloc::vec::Vec<u8> = digits.skip_while(|&d| d == b'0').collect();
+        let trailing = significant.iter().rev().take_while(|&&d| d == b'0').count();
+        let significant = significant.get(..significant.len() - trailing)?;
+        scale = scale.saturating_add(trailing as i64);
+        if significant.is_empty() {
+            return Some(0);
+        }
+        if scale < 0 || (significant.len() as i64).saturating_add(scale) > 39 {
+            return None;
+        }
+        let mut magnitude: u128 = 0;
+        for &d in significant {
+            magnitude = magnitude
+                .checked_mul(10)?
+                .checked_add(u128::from(d - b'0'))?;
+        }
+        for _ in 0..scale {
+            magnitude = magnitude.checked_mul(10)?;
+        }
+        if negative {
+            0i128.checked_sub_unsigned(magnitude)
+        } else {
+            i128::try_from(magnitude).ok()
+        }
+    }
+
     /// The number as the nearest `f32` (correctly rounded from the text
     /// itself, not through `f64`), or `None` if that is not finite (`1e39`).
     ///
@@ -621,6 +703,33 @@ mod tests {
     }
 
     #[test]
+    fn test_whole_value_edges() {
+        let n = |t: &'static str| Number::from_text(t).unwrap_or_else(|| Number::from(0));
+        assert_eq!(n("0").whole_value(), Some(0));
+        assert_eq!(n("-0.000e5").whole_value(), Some(0));
+        assert_eq!(n("1e-0").whole_value(), Some(1));
+        assert_eq!(n("1E+3").whole_value(), Some(1000));
+        assert_eq!(n("10e-1").whole_value(), Some(1));
+        assert_eq!(n("1e-1").whole_value(), None);
+        assert_eq!(n("1e99999999999999999999").whole_value(), None);
+        assert_eq!(n("1e-99999999999999999999").whole_value(), None);
+        assert_eq!(n("0e99999999999999999999").whole_value(), Some(0));
+        assert_eq!(
+            n("-170141183460469231731687303715884105728").whole_value(),
+            Some(i128::MIN)
+        );
+        assert_eq!(
+            n("170141183460469231731687303715884105728").whole_value(),
+            None
+        );
+        assert_eq!(
+            n("1.7014118346046923173168730371588410572e38").whole_value(),
+            Some(170_141_183_460_469_231_731_687_303_715_884_105_720)
+        );
+        assert_eq!(n("1.23e2").whole_value(), Some(123));
+    }
+
+    #[test]
     fn test_wide_and_narrow_conversions() {
         let n = |t: &'static str| Number::from_text(t).unwrap_or_else(|| Number::from(0));
         assert_eq!(n("170141183460469231731687303715884105728").as_i128(), None);
@@ -653,6 +762,19 @@ mod tests {
             prop_assert!(write_f32(&mut out, x));
             prop_assert!(lexer::is_number(&out), "{}", out);
             prop_assert_eq!(out.parse::<f32>().map(f32::to_bits).ok(), Some(x.to_bits()));
+        }
+
+        /// Every spelling of an integer reads back as the integer.
+        #[test]
+        fn prop_whole_value_of_any_spelling(n in any::<i64>(), shift in 0usize..20, zeros in 0usize..4) {
+            let plain = alloc::format!("{n}");
+            prop_assert_eq!(Number::from_text(&plain).and_then(|x| x.whole_value()), Some(i128::from(n)));
+            // n * 10^shift written as n followed by `zeros` zeros and an exponent.
+            let spelled = alloc::format!("{n}{}e{}", "0".repeat(zeros), shift as i64 - zeros as i64);
+            let want = i128::from(n).checked_mul(10i128.pow(shift as u32));
+            prop_assert_eq!(Number::from_text(&spelled).and_then(|x| x.whole_value()), want);
+            let fraction = alloc::format!("{n}.{}", "0".repeat(zeros + 1));
+            prop_assert_eq!(Number::from_text(&fraction).and_then(|x| x.whole_value()), Some(i128::from(n)));
         }
 
         #[test]

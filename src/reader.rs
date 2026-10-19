@@ -484,6 +484,18 @@ impl<'a> Reader<'a> {
 
     // ---- internals -----------------------------------------------------------
 
+    /// Sets how typed reads take integers.
+    pub(crate) const fn with_numbers(mut self, numbers: crate::Numbers) -> Self {
+        self.machine.numbers = numbers;
+        self
+    }
+
+    /// How typed reads take integers.
+    #[inline]
+    pub(crate) const fn number_policy(&self) -> crate::Numbers {
+        self.machine.numbers
+    }
+
     /// Whether a value comes next (consuming a separating `,`).
     #[inline]
     pub(crate) fn at_a_value(&mut self) -> Result<bool, Error> {

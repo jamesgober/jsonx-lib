@@ -63,6 +63,43 @@ pub enum DuplicateKeys {
     KeepAll,
 }
 
+/// How typed reads ([`FromJson`](crate::FromJson)) of integers treat a
+/// number written as a fraction or with an exponent.
+///
+/// JSON has one number type, and writers differ on how they spell a whole
+/// number: some write `100`, some `100.0` or `1e2`. The default reads an
+/// integer type only from integer text, as [`Number::as_i64`](crate::Number::as_i64)
+/// does, so a value that was meant as a float is never silently taken as an
+/// integer. `WholeValues` also accepts any spelling of a whole number, read
+/// exactly ([`Number::whole_value`](crate::Number::whole_value)); a
+/// fractional value is still refused.
+///
+/// The enum is `#[non_exhaustive]`.
+///
+/// # Examples
+///
+/// ```
+/// use jsonx_lib::{Numbers, Parser};
+///
+/// assert!(Parser::new().decode::<u32>("1e2").is_err());
+/// let lenient = Parser::new().numbers(Numbers::WholeValues);
+/// assert_eq!(lenient.decode::<u32>("1e2")?, 100);
+/// assert_eq!(lenient.decode::<u32>("7.0")?, 7);
+/// assert!(lenient.decode::<u32>("7.5").is_err());
+/// # Ok::<(), jsonx_lib::DecodeError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Numbers {
+    /// Integers from integer text only (`100`); `1e2` and `100.0` are
+    /// refused for an integer type. The default.
+    #[default]
+    IntegerText,
+    /// Integers from any spelling of a whole number (`100`, `1e2`,
+    /// `100.0`), within `i128`'s range for exponent or fraction forms.
+    WholeValues,
+}
+
 /// A configured parser: [`Limits`] and a [`DuplicateKeys`] policy.
 ///
 /// [`parse`](crate::parse) is `Parser::new().parse`. Build a `Parser` to
@@ -89,6 +126,7 @@ pub enum DuplicateKeys {
 pub struct Parser {
     limits: Limits,
     duplicates: DuplicateKeys,
+    numbers: Numbers,
 }
 
 impl Parser {
@@ -104,6 +142,7 @@ impl Parser {
         Self {
             limits: Limits::new(),
             duplicates: DuplicateKeys::Error,
+            numbers: Numbers::IntegerText,
         }
     }
 
@@ -136,6 +175,33 @@ impl Parser {
     pub const fn duplicate_keys(mut self, policy: DuplicateKeys) -> Self {
         self.duplicates = policy;
         self
+    }
+
+    /// Sets how typed reads take integers; see [`Numbers`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Numbers, Parser};
+    ///
+    /// let p = Parser::new().numbers(Numbers::WholeValues);
+    /// assert_eq!(p.get_numbers(), Numbers::WholeValues);
+    /// ```
+    pub const fn numbers(mut self, numbers: Numbers) -> Self {
+        self.numbers = numbers;
+        self
+    }
+
+    /// The parser's [`Numbers`] setting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(jsonx_lib::Parser::new().get_numbers(), jsonx_lib::Numbers::IntegerText);
+    /// ```
+    #[must_use]
+    pub const fn get_numbers(&self) -> Numbers {
+        self.numbers
     }
 
     /// The parser's budgets.
@@ -235,7 +301,7 @@ impl Parser {
     /// ```
     #[must_use]
     pub fn reader<'a>(&self, text: &'a str) -> Reader<'a> {
-        Reader::with_config(text, self.limits, self.duplicates)
+        Reader::with_config(text, self.limits, self.duplicates).with_numbers(self.numbers)
     }
 
     /// A [`Reader`] over bytes, which must be UTF-8. The size budget and the

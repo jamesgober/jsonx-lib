@@ -132,6 +132,8 @@ pub(crate) struct Machine {
     pub(crate) copy_keys: bool,
     /// Read a sequence of documents: after one ends, another may follow.
     pub(crate) documents: bool,
+    /// How typed reads take integers.
+    pub(crate) numbers: crate::Numbers,
     objects: Vec<OpenObject>,
     /// The opening quote of each key of the open objects.
     quotes: Vec<usize>,
@@ -160,6 +162,7 @@ impl Machine {
             pending: Pending::None,
             copy_keys: false,
             documents: false,
+            numbers: crate::Numbers::IntegerText,
             objects: Vec::new(),
             quotes: Vec::new(),
             prints: Vec::new(),

@@ -14,8 +14,8 @@ use std::{
 use common::strategies::value;
 use jsonx_lib::{
     Array, DecodeError, DecodeErrorKind, DuplicateKeys, ErrorKind, FromJson, Kind, Limits,
-    Nullable, Number, Object, Parser, PathSegment, RawValue, Reader, Step, StreamReader, ToJson,
-    Value, ValueWriter, Written, from_str,
+    Nullable, Number, Numbers, Object, Parser, PathSegment, RawValue, Reader, Step, StreamReader,
+    ToJson, Value, ValueWriter, Written, from_str,
 };
 use proptest::prelude::*;
 
@@ -171,6 +171,34 @@ fn test_every_integer_type_at_its_limits() {
     assert_eq!(
         kind_of(from_str::<u8>("-1")),
         Some(DecodeErrorKind::OutOfRange { expected: "u8" })
+    );
+}
+
+#[test]
+fn test_whole_values_option_reads_any_spelling_of_an_integer() {
+    let strict = Parser::new();
+    let lenient = Parser::new().numbers(Numbers::WholeValues);
+    for text in ["100", "1e2", "100.0", "1000e-1", "0.1e3"] {
+        assert_eq!(lenient.decode::<u8>(text).ok(), Some(100), "{text}");
+        assert_eq!(lenient.decode::<i128>(text).ok(), Some(100), "{text}");
+    }
+    assert!(strict.decode::<u8>("1e2").is_err());
+    assert_eq!(
+        kind_of(lenient.decode::<u8>("2.5e0")),
+        Some(DecodeErrorKind::OutOfRange { expected: "u8" })
+    );
+    assert_eq!(
+        kind_of(lenient.decode::<u8>("3e2")),
+        Some(DecodeErrorKind::OutOfRange { expected: "u8" })
+    );
+    assert_eq!(lenient.decode::<i64>("-5.0e0").ok(), Some(-5));
+    assert_eq!(lenient.decode::<f64>("1e2").ok(), Some(100.0));
+    let mut stream = lenient.stream_reader();
+    assert!(stream.feed(b"[1e1, 2.0]").is_ok());
+    stream.end_input();
+    assert_eq!(
+        stream.decode::<Vec<u8>>().ok(),
+        Some(Step::Ready(Some(vec![10, 2])))
     );
 }
 
