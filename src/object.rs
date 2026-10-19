@@ -220,6 +220,61 @@ impl<'a> Object<'a> {
         Some(self.members.remove(at).1)
     }
 
+    /// Keeps only the members for which `keep` returns `true`, in order;
+    /// `keep` may change the values it keeps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut v = jsonx_lib::json!({ "a": 1, "b": null, "c": 3 });
+    /// v.as_object_mut().unwrap().retain(|_, value| !value.is_null());
+    /// assert_eq!(v.to_string(), r#"{"a":1,"c":3}"#);
+    /// ```
+    pub fn retain(&mut self, mut keep: impl FnMut(&str, &mut Value<'a>) -> bool) {
+        self.members.retain_mut(|(key, value)| keep(key, value));
+    }
+
+    /// Sorts the members by key (byte order; members with equal keys keep
+    /// their order), for output that does not depend on how the object was
+    /// built.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut v = jsonx_lib::json!({ "b": 1, "a": 2 });
+    /// v.as_object_mut().unwrap().sort_keys();
+    /// assert_eq!(v.to_string(), r#"{"a":2,"b":1}"#);
+    /// ```
+    pub fn sort_keys(&mut self) {
+        self.members.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+
+    /// The member named `key`, to read, change, or insert in one lookup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{json, Value};
+    ///
+    /// let mut v = json!({ "hits": 1 });
+    /// let obj = v.as_object_mut().unwrap();
+    /// for key in ["hits", "misses", "hits"] {
+    ///     let count = obj.entry(key).or_insert(0);
+    ///     *count = Value::from(count.as_i64().unwrap_or(0) + 1);
+    /// }
+    /// assert_eq!(v.to_string(), r#"{"hits":3,"misses":1}"#);
+    /// ```
+    pub fn entry(&mut self, key: impl Into<Cow<'a, str>>) -> Entry<'_, 'a> {
+        let key = key.into();
+        match self.members.iter().position(|(k, _)| *k == key) {
+            Some(index) => Entry::Occupied(OccupiedEntry {
+                object: self,
+                index,
+            }),
+            None => Entry::Vacant(VacantEntry { object: self, key }),
+        }
+    }
+
     /// Iterates over the members as `(key, value)` pairs, in order.
     ///
     /// # Examples
@@ -340,6 +395,14 @@ impl<'a> Object<'a> {
         }
     }
 
+    /// The value of the member at `index`. Only the entry API calls this,
+    /// with an index it just found or pushed while it holds the object
+    /// exclusively, so the index is always in bounds.
+    #[allow(clippy::indexing_slicing)]
+    fn member_value(&mut self, index: usize) -> &mut Value<'a> {
+        &mut self.members[index].1
+    }
+
     #[inline]
     pub(crate) fn members_mut(&mut self) -> &mut Vec<Member<'a>> {
         &mut self.members
@@ -374,6 +437,193 @@ impl PartialEq for Object<'_> {
 }
 
 impl Eq for Object<'_> {}
+
+impl core::hash::Hash for Object<'_> {
+    /// Hashes as the [`Value::Object`] it would be: consistent with `==`.
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        for (key, value) in self {
+            key.hash(state);
+            value.hash(state);
+        }
+    }
+}
+
+/// One member of an [`Object`], there or not; from [`Object::entry`].
+#[derive(Debug)]
+pub enum Entry<'o, 'a> {
+    /// The object has a member with the key (the first, if several).
+    Occupied(OccupiedEntry<'o, 'a>),
+    /// It does not.
+    Vacant(VacantEntry<'o, 'a>),
+}
+
+impl<'o, 'a> Entry<'o, 'a> {
+    /// The member's value, inserting `default` first if it is missing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut o = jsonx_lib::Object::new();
+    /// o.entry("list").or_insert(jsonx_lib::json!([])).as_array_mut().unwrap().push(1.into());
+    /// assert_eq!(o["list"][0], 1);
+    /// ```
+    pub fn or_insert(self, default: impl Into<Value<'a>>) -> &'o mut Value<'a> {
+        match self {
+            Self::Occupied(entry) => entry.into_mut(),
+            Self::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// The member's value, inserting what `default` makes first if it is
+    /// missing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut o = jsonx_lib::Object::new();
+    /// assert!(o.entry("k").or_insert_with(|| "made".into()) == "made");
+    /// ```
+    pub fn or_insert_with(self, default: impl FnOnce() -> Value<'a>) -> &'o mut Value<'a> {
+        match self {
+            Self::Occupied(entry) => entry.into_mut(),
+            Self::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// The member's value, inserting `null` first if it is missing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut o = jsonx_lib::Object::new();
+    /// assert!(o.entry("k").or_default().is_null());
+    /// assert_eq!(o.len(), 1);
+    /// ```
+    pub fn or_default(self) -> &'o mut Value<'a> {
+        self.or_insert(Value::Null)
+    }
+
+    /// Runs `change` on the value if the member is there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut v = jsonx_lib::json!({ "n": 1 });
+    /// let o = v.as_object_mut().unwrap();
+    /// o.entry("n").and_modify(|n| *n = 2.into()).or_insert(0);
+    /// o.entry("m").and_modify(|n| *n = 2.into()).or_insert(0);
+    /// assert_eq!(v.to_string(), r#"{"n":2,"m":0}"#);
+    /// ```
+    #[must_use]
+    pub fn and_modify(self, change: impl FnOnce(&mut Value<'a>)) -> Self {
+        match self {
+            Self::Occupied(mut entry) => {
+                change(entry.get_mut());
+                Self::Occupied(entry)
+            }
+            vacant @ Self::Vacant(_) => vacant,
+        }
+    }
+
+    /// The member's key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(jsonx_lib::Object::new().entry("k").key(), "k");
+    /// ```
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Occupied(entry) => entry.key(),
+            Self::Vacant(entry) => &entry.key,
+        }
+    }
+}
+
+/// A member that is there; see [`Entry`].
+#[derive(Debug)]
+pub struct OccupiedEntry<'o, 'a> {
+    object: &'o mut Object<'a>,
+    index: usize,
+}
+
+impl<'o, 'a> OccupiedEntry<'o, 'a> {
+    /// The key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.object.members.get(self.index).map_or("", |(k, _)| k)
+    }
+
+    /// The value.
+    #[must_use]
+    pub fn get(&self) -> &Value<'a> {
+        self.object
+            .members
+            .get(self.index)
+            .map_or(&crate::value::NULL, |(_, v)| v)
+    }
+
+    /// The value, mutably.
+    pub fn get_mut(&mut self) -> &mut Value<'a> {
+        let index = self.index;
+        self.object.member_value(index)
+    }
+
+    /// The value, mutably, for as long as the object is borrowed.
+    pub fn into_mut(self) -> &'o mut Value<'a> {
+        self.object.member_value(self.index)
+    }
+
+    /// Replaces the value and returns the old one.
+    pub fn insert(&mut self, value: impl Into<Value<'a>>) -> Value<'a> {
+        core::mem::replace(self.get_mut(), value.into())
+    }
+
+    /// Removes the member, keeping the others' order, and returns its value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Entry;
+    ///
+    /// let mut v = jsonx_lib::json!({ "a": 1, "b": 2 });
+    /// if let Entry::Occupied(e) = v.as_object_mut().unwrap().entry("a") {
+    ///     assert_eq!(e.remove(), 1);
+    /// }
+    /// assert_eq!(v.to_string(), r#"{"b":2}"#);
+    /// ```
+    pub fn remove(self) -> Value<'a> {
+        if self.index < self.object.members.len() {
+            self.object.members.remove(self.index).1
+        } else {
+            Value::Null
+        }
+    }
+}
+
+/// A member that is not there; see [`Entry`].
+#[derive(Debug)]
+pub struct VacantEntry<'o, 'a> {
+    object: &'o mut Object<'a>,
+    key: Cow<'a, str>,
+}
+
+impl<'o, 'a> VacantEntry<'o, 'a> {
+    /// The key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Appends the member and returns its value.
+    pub fn insert(self, value: impl Into<Value<'a>>) -> &'o mut Value<'a> {
+        let index = self.object.members.len();
+        self.object.members.push((self.key, value.into()));
+        self.object.member_value(index)
+    }
+}
 
 impl fmt::Debug for Object<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

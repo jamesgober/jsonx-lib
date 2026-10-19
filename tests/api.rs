@@ -331,3 +331,132 @@ fn test_reader_loop_with_duplicate_method_is_refused_like_parse() {
         .reader(text);
     assert!(r.read_raw().is_ok_and(|raw| raw == Some(text)));
 }
+
+#[test]
+fn test_array_and_object_apis_cover_every_conversion() {
+    use jsonx_lib::{Array, Entry, Object};
+
+    // Array: construction, conversion, iteration, extension, equality.
+    let mut a = Array::with_capacity(4);
+    assert!(a.capacity() >= 4);
+    a.extend([1, 2]);
+    a.push(Value::from("x"));
+    assert_eq!(
+        a,
+        Array::from(vec![Value::from(1), Value::from(2), Value::from("x")])
+    );
+    assert_ne!(a, Array::new());
+    assert_eq!(format!("{a:?}"), r#"[1, 2, "x"]"#);
+    for item in &mut a {
+        if item.is_number() {
+            *item = Value::Null;
+        }
+    }
+    assert_eq!((&a).into_iter().filter(|v| v.is_null()).count(), 2);
+    let owned: Array<'static> = {
+        let text = String::from(r#"["borrowed"]"#);
+        jsonx_lib::parse(&text)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_owned()
+    };
+    assert_eq!(owned[0], "borrowed");
+    assert_eq!(a.clone().into_vec().len(), 3);
+    assert_eq!(a.into_iter().count(), 3);
+
+    // Object: the same, plus keys, values, and the mutable iterator from
+    // both ends.
+    let mut o = Object::with_capacity(2);
+    o.extend([("a", 1), ("b", 2)]);
+    o.push("c", true);
+    assert_eq!(o.values().count(), 3);
+    assert_eq!(o.keys().rev().collect::<Vec<_>>(), ["c", "b", "a"]);
+    assert_eq!(format!("{o:?}"), r#"{"a": 1, "b": 2, "c": true}"#);
+    let mut it = o.iter_mut();
+    assert_eq!(it.len(), 3);
+    if let Some((key, value)) = it.next_back() {
+        assert_eq!(key, "c");
+        *value = Value::Null;
+    }
+    assert_eq!(
+        o.iter().next_back().map(|(k, v)| (k, v.is_null())),
+        Some(("c", true))
+    );
+    for (_, value) in &mut o {
+        if *value == 2 {
+            *value = Value::from(20);
+        }
+    }
+    assert_eq!(o["b"], 20);
+    assert!(o["missing"].is_null());
+    assert_eq!(o, o.clone());
+    assert_ne!(o, Object::new());
+    let pairs: Vec<_> = o.clone().into_iter().map(|(k, _)| k.into_owned()).collect();
+    assert_eq!(pairs, ["a", "b", "c"]);
+    assert_eq!(o.clone().into_vec().len(), 3);
+    let owned: Object<'static> = {
+        let text = String::from(r#"{"k": "v"}"#);
+        jsonx_lib::parse(&text)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+            .into_owned()
+    };
+    assert_eq!(owned["k"], "v");
+
+    // retain, sort_keys, and the entry API.
+    o.retain(|key, _| key != "a");
+    o.push("a", 0);
+    o.sort_keys();
+    assert_eq!(o.keys().collect::<Vec<_>>(), ["a", "b", "c"]);
+    match o.entry("b") {
+        Entry::Occupied(mut e) => {
+            assert_eq!((e.key(), e.get().as_i64()), ("b", Some(20)));
+            assert_eq!(e.insert(21), 20);
+            assert_eq!(e.remove(), 21);
+        }
+        Entry::Vacant(_) => panic!("b is there"),
+    }
+    match o.entry("z") {
+        Entry::Vacant(e) => {
+            assert_eq!(e.key(), "z");
+            *e.insert(1) = Value::from(2);
+        }
+        Entry::Occupied(_) => panic!("z is not there"),
+    }
+    assert_eq!(o["z"], 2);
+    assert_eq!(o.entry("z").key(), "z");
+    assert!(o.entry("new").or_insert_with(|| Value::from("v")) == "v");
+    assert_eq!(
+        o.entry("new")
+            .and_modify(|v| *v = Value::from(3))
+            .or_default(),
+        &Value::from(3)
+    );
+}
+
+#[test]
+fn test_value_comparisons_with_wide_and_platform_integers() {
+    let big = jsonx_lib::parse("18446744073709551616").unwrap_or_default(); // u64::MAX + 1
+    assert_ne!(big, u64::MAX);
+    assert_eq!(big, u128::from(u64::MAX) + 1);
+    assert_eq!(Value::from(-5), -5isize);
+    assert_ne!(Value::from(-5), 5usize);
+    assert_eq!(Value::from(5), 5usize);
+    assert_ne!(Value::from("5"), 5usize);
+    let mut v = json!({ "list": [1] });
+    assert!(v.pointer_mut("").is_some());
+    assert!(v.pointer_mut("list").is_none());
+    assert!(v.pointer_mut("/list/0/x").is_none());
+    assert!(v.pointer_mut("/list/~2").is_none());
+    assert_eq!(format!("{:?}", Number::from(7)), "7");
+    assert_eq!(
+        format!(
+            "{}",
+            Number::from_text("1e5").unwrap_or_else(|| Number::from(0))
+        ),
+        "1e5"
+    );
+    assert_eq!(format!("{:?}", json!({ "a": [null] })), r#"{"a":[null]}"#);
+}

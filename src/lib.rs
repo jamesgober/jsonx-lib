@@ -106,7 +106,7 @@ pub use error::{Error, ErrorKind};
 pub use format::Format;
 pub use limits::Limits;
 pub use number::Number;
-pub use object::{Iter, IterMut, Object};
+pub use object::{Entry, Iter, IterMut, Object, OccupiedEntry, VacantEntry};
 pub use parser::{DuplicateKeys, Parser};
 pub use raw::RawValue;
 pub use reader::{Event, Reader};

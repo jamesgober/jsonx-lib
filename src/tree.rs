@@ -10,7 +10,10 @@
 //! without allocating, and flattens anything deeper onto an explicit stack.
 
 use alloc::{borrow::Cow, vec, vec::Vec};
-use core::{mem, slice};
+use core::{
+    hash::{Hash, Hasher},
+    mem, slice,
+};
 
 use crate::{Array, Object, Value};
 
@@ -207,6 +210,48 @@ pub(crate) fn eq(a: &Value<'_>, b: &Value<'_>) -> bool {
         match stack.pop() {
             Some((p, q)) => (x, y) = (p, q),
             None => return true,
+        }
+    }
+}
+
+/// What [`hash`] still has to feed the hasher.
+enum Pending<'r, 'a> {
+    Value(&'r Value<'a>),
+    Key(&'r str),
+}
+
+/// Feeds `value` to `state`, consistently with [`eq`]: the kind, then the
+/// scalar (a number by its text), or a container's length and children in
+/// order (an object's keys with their values). Iterative at any depth; a
+/// scalar costs no allocation.
+pub(crate) fn hash<H: Hasher>(value: &Value<'_>, state: &mut H) {
+    let mut stack: Vec<Pending<'_, '_>> = Vec::new();
+    let mut next = Some(Pending::Value(value));
+    while let Some(item) = next.take().or_else(|| stack.pop()) {
+        let value = match item {
+            Pending::Key(key) => {
+                key.hash(state);
+                continue;
+            }
+            Pending::Value(value) => value,
+        };
+        mem::discriminant(value).hash(state);
+        match value {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Number(n) => n.as_str().hash(state),
+            Value::String(s) => s.as_ref().hash(state),
+            Value::Array(a) => {
+                a.len().hash(state);
+                stack.extend(a.iter().rev().map(Pending::Value));
+            }
+            Value::Object(o) => {
+                o.len().hash(state);
+                for (key, child) in o.as_slice().iter().rev() {
+                    stack.push(Pending::Value(child));
+                    stack.push(Pending::Key(key));
+                }
+            }
         }
     }
 }

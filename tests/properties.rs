@@ -237,6 +237,18 @@ proptest! {
         prop_assert_eq!(out, jsonx_lib::to_string_with(&v, format));
     }
 
+    /// `Hash` agrees with `==`: a value and its round trip hash alike.
+    #[test]
+    fn prop_hash_agrees_with_eq(v in value()) {
+        use std::hash::{BuildHasher, RandomState};
+        let state = RandomState::new();
+        let text = jsonx_lib::to_string(&v);
+        let back = GRAMMAR_ONLY.parse(&text).unwrap_or_default();
+        prop_assert_eq!(&back, &v);
+        prop_assert_eq!(state.hash_one(&back), state.hash_one(&v));
+        prop_assert_eq!(state.hash_one(back.into_owned()), state.hash_one(&v));
+    }
+
     /// Clone, equality, and `into_owned` agree with each other.
     #[test]
     fn prop_clone_and_into_owned_preserve_equality(v in value()) {
