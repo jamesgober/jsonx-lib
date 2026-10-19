@@ -182,6 +182,68 @@ impl<'a> Number<'a> {
         }
     }
 
+    /// The number as an `i128`, if its text is an integer in `i128`'s range.
+    /// `None` otherwise: nothing is rounded or truncated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let big = Number::from_text("-170141183460469231731687303715884105728").unwrap();
+    /// assert_eq!(big.as_i128(), Some(i128::MIN));
+    /// assert_eq!(Number::from_text("1e3").unwrap().as_i128(), None);
+    /// ```
+    #[must_use]
+    pub fn as_i128(&self) -> Option<i128> {
+        if self.is_integer() {
+            self.text.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// The number as a `u128`, if its text is an integer in `u128`'s range.
+    /// `-0` reads as `0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// let n = Number::from_text("340282366920938463463374607431768211455").unwrap();
+    /// assert_eq!(n.as_u128(), Some(u128::MAX));
+    /// assert_eq!(Number::from_text("-0").unwrap().as_u128(), Some(0));
+    /// assert_eq!(Number::from_text("-1").unwrap().as_u128(), None);
+    /// ```
+    #[must_use]
+    pub fn as_u128(&self) -> Option<u128> {
+        if !self.is_integer() {
+            return None;
+        }
+        match self.text.strip_prefix('-') {
+            Some("0") => Some(0),
+            Some(_) => None,
+            None => self.text.parse().ok(),
+        }
+    }
+
+    /// The number as the nearest `f32` (correctly rounded from the text
+    /// itself, not through `f64`), or `None` if that is not finite (`1e39`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Number;
+    ///
+    /// assert_eq!(Number::from_text("0.1").unwrap().as_f32(), Some(0.1));
+    /// assert_eq!(Number::from_text("1e39").unwrap().as_f32(), None);
+    /// ```
+    #[must_use]
+    pub fn as_f32(&self) -> Option<f32> {
+        self.text.parse::<f32>().ok().filter(|x| x.is_finite())
+    }
+
     /// The number as the nearest `f64` (correctly rounded), or `None` if it is
     /// too large in magnitude to be finite (`1e400`). A value too small to
     /// represent rounds to zero, as IEEE 754 does. Integers beyond 2^53 lose
@@ -556,6 +618,18 @@ mod tests {
         }
         assert_eq!(Number::from(isize::MIN).as_i64(), Some(isize::MIN as i64));
         assert_eq!(Number::from(usize::MAX).as_u64(), Some(usize::MAX as u64));
+    }
+
+    #[test]
+    fn test_wide_and_narrow_conversions() {
+        let n = |t: &'static str| Number::from_text(t).unwrap_or_else(|| Number::from(0));
+        assert_eq!(n("170141183460469231731687303715884105728").as_i128(), None);
+        assert_eq!(n("2.5").as_u128(), None);
+        assert_eq!(n("2.5").as_i128(), None);
+        assert_eq!(n("12").as_u128(), Some(12));
+        assert_eq!(n("-3").as_f32(), Some(-3.0));
+        // The same text rounds to f32 directly: no double rounding.
+        assert_eq!(n("16777217").as_f32(), Some(16_777_216.0));
     }
 
     #[test]
