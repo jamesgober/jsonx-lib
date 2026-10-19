@@ -69,6 +69,33 @@ pub(crate) fn fingerprint(bytes: &[u8]) -> u64 {
     head ^ tail.rotate_left(29) ^ (bytes.len() as u64).rotate_left(56)
 }
 
+/// [`fingerprint`] of `text[start..end]`, without copying a short key: when
+/// eight bytes of `text` follow `start` (as they do for any key but one at
+/// the very end of a partial text), the key's first word is one load, masked
+/// to its length.
+#[inline]
+pub(crate) fn fingerprint_at(text: &[u8], start: usize, end: usize) -> u64 {
+    let len = end.saturating_sub(start);
+    let word = |at: usize| {
+        text.get(at..)
+            .and_then(<[u8]>::first_chunk::<8>)
+            .map(|w| u64::from_le_bytes(*w))
+    };
+    let (head, tail) = if len >= 8 {
+        match (word(start), word(end - 8)) {
+            (Some(head), Some(tail)) => (head, tail),
+            _ => return fingerprint(text.get(start..end).unwrap_or_default()),
+        }
+    } else {
+        match word(start) {
+            // `len < 8`: the bytes past the key are masked off.
+            Some(w) => (w & ((1u64 << (8 * len)) - 1), 0),
+            None => return fingerprint(text.get(start..end).unwrap_or_default()),
+        }
+    };
+    head ^ tail.rotate_left(29) ^ (len as u64).rotate_left(56)
+}
+
 /// Calls `f(run)` for each run of equal keys in the sorted `order` (each run
 /// sorted by position, the first being the first occurrence).
 pub(crate) fn for_each_run<'k>(
@@ -105,6 +132,20 @@ pub(crate) fn first_repeat<'k>(key: &impl Fn(usize) -> &'k str, order: &[usize])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fingerprint_at_matches_the_fingerprint_of_the_slice() {
+        let text = b"0123456789abcdefghij";
+        for start in 0..=text.len() {
+            for end in start..=text.len() {
+                assert_eq!(
+                    fingerprint_at(text, start, end),
+                    fingerprint(&text[start..end]),
+                    "{start}..{end}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_pairwise_and_sorted_paths_agree() {

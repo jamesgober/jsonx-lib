@@ -92,6 +92,7 @@ mod parser;
 mod raw;
 mod reader;
 mod scan;
+mod small;
 mod stream;
 mod tree;
 mod value;
