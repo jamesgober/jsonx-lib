@@ -148,6 +148,35 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Reads a sequence of documents instead of one: after a document's
+    /// value, another may follow, separated by any whitespace (or by
+    /// nothing, where the grammar allows: `[1][2]`). This reads
+    /// newline-delimited JSON (NDJSON, JSON Lines) and concatenated JSON.
+    /// Each document has its own [`Limits::max_elements`]; the input size
+    /// budget covers them all. Events run on from one document into the
+    /// next; [`read_value`](Self::read_value) and the other whole-value
+    /// reads return one document each, and `Ok(None)` after the last.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::Reader;
+    ///
+    /// let lines = "{\"n\": 1}\n{\"n\": 2}\n";
+    /// let mut r = Reader::new(lines).documents();
+    /// let mut total = 0;
+    /// while let Some(doc) = r.read_value()? {
+    ///     total += doc["n"].as_i64().unwrap_or(0);
+    /// }
+    /// assert_eq!(total, 3);
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn documents(mut self) -> Self {
+        self.machine.documents = true;
+        self
+    }
+
     /// Reads the next event, or `Ok(None)` once the document's value is
     /// complete and nothing but whitespace follows it.
     ///

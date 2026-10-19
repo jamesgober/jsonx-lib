@@ -222,6 +222,36 @@ impl StreamReader {
         }
     }
 
+    /// Reads a sequence of documents instead of one, as
+    /// [`Reader::documents`](crate::Reader::documents) does: NDJSON, JSON
+    /// Lines, or concatenated JSON, fed as it arrives. Whole-value reads
+    /// return one document each, and `Ready(None)` once the input has ended
+    /// after the last.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{Step, StreamReader};
+    ///
+    /// let mut r = StreamReader::new().documents();
+    /// let mut seen = Vec::new();
+    /// for chunk in [&b"{\"id\": 1}\n{\"i"[..], b"d\": 2}\n"] {
+    ///     r.feed(chunk)?;
+    ///     while let Step::Ready(Some(doc)) = r.read_value()? {
+    ///         seen.push(doc["id"].as_i64());
+    ///     }
+    /// }
+    /// r.end_input();
+    /// assert_eq!(r.read_value()?, Step::Ready(None));
+    /// assert_eq!(seen, [Some(1), Some(2)]);
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn documents(mut self) -> Self {
+        self.machine.documents = true;
+        self
+    }
+
     /// Adds the next piece of input. A chunk may end anywhere, even inside a
     /// token or a UTF-8 character.
     ///

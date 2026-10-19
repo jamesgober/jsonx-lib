@@ -130,6 +130,8 @@ pub(crate) struct Machine {
     /// Keep every key in the arena, not as a slice of the text (for a text
     /// whose front is dropped as it is read).
     pub(crate) copy_keys: bool,
+    /// Read a sequence of documents: after one ends, another may follow.
+    pub(crate) documents: bool,
     objects: Vec<OpenObject>,
     /// The opening quote of each key of the open objects.
     quotes: Vec<usize>,
@@ -157,6 +159,7 @@ impl Machine {
             complete,
             pending: Pending::None,
             copy_keys: false,
+            documents: false,
             objects: Vec::new(),
             quotes: Vec::new(),
             prints: Vec::new(),
@@ -284,6 +287,14 @@ impl Machine {
         let next = bytes.get(self.pos).copied();
         Ok(match self.state {
             State::Value | State::Element => true,
+            State::End if self.documents => match next {
+                Some(_) => {
+                    self.next_document();
+                    true
+                }
+                None if !self.complete => return Err(Self::end_error(src)),
+                None => false,
+            },
             State::ArrayFirst => match next {
                 None if !self.complete => return Err(Self::end_error(src)),
                 next => next != Some(b']'),
@@ -383,6 +394,10 @@ impl Machine {
                             self.state = State::Done;
                             Ok(None)
                         }
+                        Some(_) if self.documents => {
+                            self.next_document();
+                            continue;
+                        }
                         Some(_) => err(ErrorKind::TrailingCharacters),
                     };
                 }
@@ -406,6 +421,12 @@ impl Machine {
             Pending::Num { start, scan } => self.number(src, start, scan),
             Pending::Literal { start } => self.literal(src, start),
         }
+    }
+
+    /// Starts the next document of a sequence: its own element budget.
+    fn next_document(&mut self) {
+        self.state = State::Value;
+        self.elements = 0;
     }
 
     /// The state after a value completes in the current container.
@@ -779,6 +800,34 @@ mod tests {
                 assert_eq!(chunked(doc, chunk), want, "{doc:?} in chunks of {chunk}");
             }
         }
+    }
+
+    #[test]
+    fn test_documents_follow_one_another() {
+        let text = " 1 [2]{\"a\":3}\"s\"
+null ";
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, true);
+        m.documents = true;
+        let mut events = Vec::new();
+        while let Ok(Some(e)) = m.step(text) {
+            events.push(owned(e));
+        }
+        assert_eq!(events.len(), 10);
+        assert!(m.is_done());
+        // At the end of one document, another value comes next.
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, true);
+        m.documents = true;
+        assert!(m.step("1 2").is_ok());
+        assert_eq!(m.at_value("1 2"), Ok(true));
+        assert_eq!(m.peek_kind("1 2"), Some(Kind::Number));
+        // Over a partial text, the end of a document is not the end.
+        let mut m = Machine::new(Limits::new(), DuplicateKeys::Error, false);
+        m.documents = true;
+        assert!(m.step("[] ").is_ok() && m.step("[] ").is_ok());
+        assert!(m.at_value("[] ").is_err());
+        m.complete = true;
+        assert_eq!(m.at_value("[] "), Ok(false));
+        assert_eq!(m.step("[] "), Ok(None));
     }
 
     #[test]
