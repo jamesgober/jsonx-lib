@@ -68,8 +68,10 @@ pub enum Event<'a> {
 ///
 /// The reader works over a complete document held in memory, and borrows
 /// strings and numbers from it exactly as [`parse`](crate::parse) does.
-/// Reading is iterative: depth costs one byte of reader state per level, never
-/// stack.
+/// Reading is iterative: depth costs one bit of reader state per level, never
+/// stack. The reader's own state for the first 64 levels, 8 open objects, and
+/// 16 of their keys is kept inline, so reading a message of ordinary shape
+/// allocates nothing but the strings it decodes.
 ///
 /// **Duplicate keys.** Under [`DuplicateKeys::Error`], the default, the
 /// reader refuses an object that repeats a key, whichever way it is read:
@@ -219,8 +221,9 @@ impl<'a> Reader<'a> {
     /// The text is a slice of the input: it can be stored, compared, or parsed
     /// later, as `serde_json`'s `RawValue` is used. Nothing of the value is
     /// allocated; the reader's own state grows with the value's nesting (a
-    /// byte per level) and, under [`DuplicateKeys::Error`], with the keys of
-    /// its open objects.
+    /// bit per level) and, under [`DuplicateKeys::Error`], with the keys of
+    /// its open objects, on the heap only past what it keeps inline (see
+    /// [`Reader`]).
     ///
     /// # Errors
     ///

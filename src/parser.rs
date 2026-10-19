@@ -61,6 +61,9 @@ pub enum DuplicateKeys {
     /// as inserting each member into an ordered map would.
     Last,
     /// Keep every member as written. The writer reproduces the duplicates.
+    /// [`Object::get`](crate::Object::get) then finds the *first* member with
+    /// a key (`serde_json`'s map keeps the last), and typed reads of a struct
+    /// field or a map keep the last value.
     KeepAll,
 }
 

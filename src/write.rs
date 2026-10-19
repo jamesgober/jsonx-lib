@@ -27,6 +27,11 @@ const SPACES: &str = "                                                          
 /// - everything else, including `/`, DEL, and all other non-ASCII text, is
 ///   copied unchanged as UTF-8.
 ///
+/// This escaping is not HTML-safe: `<`, `>`, and `&` are copied, so
+/// `</script>` inside a string stays `</script>` in the output. For JSON
+/// placed inside HTML, write with [`Format::html_safe`] (and
+/// [`Format::ascii`] for a channel that is not 8-bit clean).
+///
 /// So no string can end the literal early or put a raw line break in it,
 /// whatever it contains: the output is always exactly one JSON string token
 /// that decodes back to `text`. Unescaped stretches are copied in bulk, found

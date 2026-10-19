@@ -52,3 +52,21 @@ LexerSketch's LSP, DAP, MCP servers and its emitters all speak JSON, and the fam
 - Writer output always parses back to the same value (round-trip property).
 - Budgets on depth, total size, string length, and number length are enforced before allocation; hostile input never panics or overflows the stack.
 - Escaping is complete: no input string can alter the structure of emitted JSON.
+
+---
+
+## 5. Recorded deviations from REPS
+
+Where this crate departs from `REPS.md`, and why. Each is deliberate.
+
+- **`Cargo.lock` is not committed** (REPS Reproducibility). The family
+  convention for libraries: a dependent resolves its own versions, and CI
+  generates a fresh lockfile for `cargo audit`.
+- **No `rust-toolchain.toml`** (REPS Reproducibility). CI builds and tests
+  every commit on stable and on the 1.85 MSRV explicitly; a pinned toolchain
+  file would override that matrix on every runner.
+- **No metrics or `tracing`** (REPS Observability). A pure parser and writer
+  with no I/O, threads, or state between calls: every outcome is returned to
+  the caller, who observes it. A runtime dependency would also break §2.
+- **`dev/` is committed** (REPS Git Conventions). The family convention: the
+  directives and roadmap are the project's engineering record.

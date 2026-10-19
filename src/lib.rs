@@ -1,61 +1,88 @@
 //! # jsonx_lib
 //!
-//! Strict RFC 8259 JSON: a parser that borrows from its input, a pull reader,
-//! and a deterministic writer, with budgets that refuse hostile input before
-//! it costs memory. No dependencies; `no_std` with `alloc`.
+//! Strict RFC 8259 JSON: a parser that borrows from its input, pull and
+//! incremental readers, typed reading and writing through hand-written
+//! [`FromJson`] and [`ToJson`] impls, and deterministic writers, with
+//! budgets that refuse hostile input before it costs memory. No
+//! dependencies; `no_std` with `alloc`.
 //!
 //! ## Quick start
 //!
 //! ```
-//! use jsonx_lib::{json, parse, to_string};
+//! use jsonx_lib::{json, json_struct, parse, to_string};
 //!
-//! let doc = parse(r#"{"name": "jsonx", "version": [0, 2, 0], "stable": false}"#)?;
+//! // A document as a tree.
+//! let doc = parse(r#"{"name": "jsonx", "version": [0, 5, 0], "stable": false}"#)?;
 //! assert_eq!(doc["name"], "jsonx");
-//! assert_eq!(doc["version"][1].as_u64(), Some(2));
+//! assert_eq!(doc["version"][1].as_u64(), Some(5));
+//!
+//! // Or straight into your own types, and back, with no tree in between.
+//! struct Position { line: u32, character: u32 }
+//! json_struct!(Position { line, character });
+//!
+//! let p: Position = jsonx_lib::from_str(r#"{"line": 3, "character": 14}"#)?;
+//! assert_eq!((p.line, p.character), (3, 14));
+//! assert_eq!(to_string(&p), r#"{"line":3,"character":14}"#);
 //!
 //! let reply = json!({ "ok": true, "items": [1, 2, 3] });
 //! assert_eq!(to_string(&reply), r#"{"ok":true,"items":[1,2,3]}"#);
-//! # Ok::<(), jsonx_lib::Error>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## The three ways in
+//! ## The ways in
 //!
-//! 1. **[`parse`] and [`to_string`]** (plus [`parse_bytes`] and
-//!    [`to_string_pretty`]): one call each, default budgets, duplicate keys
-//!    refused.
-//! 2. **[`Parser`]**: the same parse with your own [`Limits`] and
-//!    [`DuplicateKeys`] policy, kept as a `const` and reused.
+//! 1. **[`parse`], [`from_str`], and [`to_string`]** (plus [`parse_bytes`],
+//!    [`from_bytes`], [`to_string_pretty`], and [`to_string_with`]): one call
+//!    each, default budgets, duplicate keys refused.
+//! 2. **[`Parser`]**: the same with your own [`Limits`], [`DuplicateKeys`]
+//!    policy, and [`Numbers`] option, kept as a `const` and reused.
 //! 3. **[`Reader`]**: the document as a stream of [`Event`]s, with
-//!    [`read_raw`](Reader::read_raw) to keep a value as its source text and
-//!    [`read_value`](Reader::read_value) to build just one part of it.
+//!    [`read_raw`](Reader::read_raw) to keep a value as its source text,
+//!    [`read_value`](Reader::read_value) to build one part of it,
+//!    [`decode`](Reader::decode) to read one part as a type, and
+//!    [`find_pointer`](Reader::find_pointer) to go straight to one value.
+//!    [`StreamReader`] is the same reader over input that arrives in chunks;
+//!    both read sequences of documents (NDJSON) on request.
+//! 4. **Typed values**: [`FromJson`] reads a type from a [`Reader`],
+//!    borrowing strings from the input; [`ToJson`] writes a type through a
+//!    [`ValueWriter`], building nothing. Both are implemented by hand (or by
+//!    the [`json_struct!`] macro for plain structs): no derive, no
+//!    reflection. Errors are [`DecodeError`]s: what, at which byte, and where
+//!    (a JSON Pointer path).
+//! 5. **[`Writer`]**: a push writer that takes events, checked as it goes,
+//!    into a `String`, an `io::Write`, or a `fmt::Write`, in any [`Format`].
 //!
 //! ## What it guarantees
 //!
-//! - **Exactly RFC 8259.** Everything the grammar allows is accepted;
-//!   everything else is refused with an [`Error`] that names the first byte at
-//!   which the input stops being valid. Unpaired UTF-16 surrogate escapes,
-//!   which the grammar allows but which decode to no Unicode text, are
-//!   refused too.
+//! - **RFC 8259 grammar.** Everything outside the grammar is refused with an
+//!   [`Error`] that names the first byte at which the input stops being
+//!   valid. Two grammatical inputs are refused by choice: unpaired UTF-16
+//!   surrogate escapes, which decode to no Unicode text, and (under the
+//!   default [`DuplicateKeys::Error`]) objects that repeat a key, on every
+//!   way of reading.
 //! - **Borrowing.** Strings without escapes and every number are slices of the
-//!   input; only strings with escapes are copied, once, into a buffer of
-//!   exactly the right size.
-//! - **Exact numbers.** A [`Number`] keeps its text; conversion to `i64`,
-//!   `u64`, or `f64` happens when asked and never rounds silently into an
-//!   integer.
-//! - **Budgets before allocation.** Depth, input size, string length, number
-//!   length, and value count are all checked before the memory they guard is
-//!   used ([`Limits`]).
-//! - **No recursion on depth.** Parsing, writing, cloning, and comparing loop
-//!   over explicit stacks; dropping recurses at most a fixed 32 levels. A
-//!   million levels of nesting cannot overflow the stack.
-//! - **Round trip.** Written output parses back to an equal value, and the
-//!   escaping cannot be broken out of by any string ([`write_string`]).
+//!   input; a string with escapes is decoded once into a buffer no larger than
+//!   its escaped source text.
+//! - **Exact numbers.** A [`Number`] keeps its text; conversion to a Rust
+//!   number happens when asked and never rounds silently into an integer.
+//! - **Budgets.** Depth, input size, string length, number length, value
+//!   count, and the memory a parse holds for its tree are all bounded
+//!   ([`Limits`]), each checked before the memory it guards is used.
+//! - **No recursion on depth.** Parsing, the readers, writing, cloning,
+//!   comparing, and hashing loop over explicit stacks; dropping recurses at
+//!   most a fixed 32 levels. A million levels of nesting cannot overflow the
+//!   stack. (A [`FromJson`] or [`ToJson`] impl for a recursive type of your
+//!   own recurses; the depth budget bounds that on the reading side.)
+//! - **Round trip.** Written output parses back to an equal value, in every
+//!   [`Format`], and no string can break out of its quotes ([`write_string`]).
 //! - **No panics** on any input, and `#![forbid(unsafe_code)]`.
 //!
 //! ## Feature flags
 //!
-//! - `std` (default): adds [`to_writer`] and [`to_writer_pretty`]. Without it
-//!   the crate is `no_std` and needs only `alloc`.
+//! - `std` (default): adds `to_writer`, `to_writer_pretty`, `to_writer_with`,
+//!   `Writer::io`, `StreamReader::read_from`, and the `HashMap`/`HashSet`
+//!   impls of the typed traits. Without it the crate is `no_std` and needs
+//!   only `alloc`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
