@@ -767,10 +767,29 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Reads a scalar value's event for a target described by `expected`.
+    /// Reads a scalar value's event for a target described by `expected`:
+    /// one step of the reader. A container is the wrong type (its first
+    /// event is consumed, which does not matter: the read has failed); no
+    /// value at all is [`ErrorKind::ExpectedValue`] (or the reader's own
+    /// error, such as a trailing comma).
     #[inline]
     fn scalar(&mut self, expected: &'static str) -> Result<(Event<'a>, usize), DecodeError> {
-        self.value_event(None, expected)
+        match self.next_event()? {
+            Some(event @ (Event::StartArray | Event::StartObject)) => Err(DecodeError::wrong_type(
+                expected,
+                event_kind(&event),
+                self.event_offset(),
+            )),
+            Some(Event::EndArray | Event::EndObject | Event::Key(_)) => Err(DecodeError::new(
+                DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
+                self.event_offset(),
+            )),
+            Some(event) => Ok((event, self.event_offset())),
+            None => Err(DecodeError::new(
+                DecodeErrorKind::Syntax(ErrorKind::ExpectedValue),
+                self.offset(),
+            )),
+        }
     }
 }
 
