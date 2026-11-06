@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, zero dependencies.
     </p>
     <blockquote>
-        <strong>Status: 0.5.0, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, once lsp-lang and the LexerSketch API have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
+        <strong>Status: 0.5.1, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, once lsp-lang and the LexerSketch API have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
     </blockquote>
 </div>
 
@@ -240,13 +240,18 @@ incremental reader about 395 MiB/s. Typed decoding of a small request is
 2.3 to 2.6 times serde_json's derive (median about 2.5) and allocates nothing. Method and every
 number: [the release notes](./docs/release/v0.5.0.md#benchmarks).
 
+0.5.1 made writing faster without changing a byte of output: typed
+structs in 0.56 of 0.5.0's time, pretty output in 0.72, floats in about a
+third; metrics-lib's JSON snapshot is written in about 0.75 of
+`serde_json`'s time. [The 0.5.1 release notes](./docs/release/v0.5.1.md#benchmarks).
+
 <hr>
 <br>
 
 ## Documentation
 
 - [API reference](./docs/API.md): every public item, with examples, and a guide to moving a JSON-RPC server off serde_json.
-- [Release notes for 0.5.0](./docs/release/v0.5.0.md) and [for 0.2.0](./docs/release/v0.2.0.md).
+- Release notes for [0.5.1](./docs/release/v0.5.1.md), [0.5.0](./docs/release/v0.5.0.md), and [0.2.0](./docs/release/v0.2.0.md).
 - [Roadmap](./dev/ROADMAP.md) and [engineering directives](./dev/DIRECTIVES.md).
 - Examples: `cargo run --example quick_start`, `rpc_envelope`, `typed_lsp`.
 

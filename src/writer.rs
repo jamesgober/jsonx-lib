@@ -520,7 +520,11 @@ impl<'o> Writer<'o> {
             write::newline(buf, depth, format);
         }
         write::write_str(buf, key, format);
-        buf.push_str(if format.pretty { ": " } else { ":" });
+        if format.pretty {
+            buf.push_str(": ");
+        } else {
+            buf.push(':');
+        }
         self.flushed()
     }
 

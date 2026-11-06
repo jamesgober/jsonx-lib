@@ -159,6 +159,41 @@ Moved to a later phase, or decided (anti-deferral rule):
   proptest 1.12 need Rust 1.86 and 1.88, above the 1.85 MSRV that CI builds
   benches and tests with.
 
+## v0.5.1 - Writer speed (DONE, 2026-11-05)
+- [x] metrics-lib's JSON exporter on jsonx-lib took about 2.2 times its
+  `serde_json` exporter's time for the same text. Profiled by parts (no
+  sampling profiler on the reference host; micro-benchmarks of each kind of
+  token at the document's counts, and the generated code): floats about
+  half of the difference (`core`'s `{:e}`, then metrics-lib's re-layout to
+  `serde_json`'s text and a `Number::from_text` check: about 120 ns a float
+  against 14 ns), the writer's call structure most of the rest (helpers not
+  inlined across crates even under fat LTO, a run-time-length push for every
+  key's colon), integers and the output's growth a few percent. String
+  escaping was level with `serde_json`'s.
+
+Delivered:
+- **Floats.** An in-house Schubfach formatter (`src/float.rs`) replaces
+  `{:e}`: same text, checked against `core` on every `f32` and a billion
+  `f64`s (on demand) and on every exponent and boundary (always).
+- **Float options.** `Format::exponent_plus` and `Format::even_ties`
+  (additive), so a consumer that must match `serde_json`'s text (metrics-lib)
+  needs no layout code of its own.
+- **Strings.** A whole-string test in words before copying in one piece; the
+  escaping scan resumes where it stopped; the key path always inlined, so a
+  literal key costs no scan at run time.
+- **Smaller items.** Integers by digit pairs with no UTF-8 check; `usize`
+  and `isize` through 64 bits; constant-length pushes; `to_string` starting
+  at 128 bytes.
+
+Decided (anti-deferral rule):
+- **The default tie rule stays `core`'s** (the higher of two equally close
+  texts), so 0.5.1 writes the same bytes as 0.5.0 in every default format
+  and can be a patch release. Making the even digit the default (the more
+  common rule elsewhere) would change output bytes; it is a 0.6 or 1.0
+  question, not taken here.
+- **No pre-checked key type.** Inlining the key path gives literal keys the
+  same saving without new API.
+
 ## v0.9.0 - Hardening
 - [x] Fuzz targets (delivered in 0.5, see above).
 - [ ] Long fuzz campaigns with a kept corpus.

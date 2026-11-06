@@ -1,4 +1,4 @@
-//! Output options: layout and escaping.
+//! Output options: layout, escaping, and float text.
 
 /// How the writers lay out and escape their output.
 ///
@@ -16,7 +16,15 @@
 ///   (a surrogate pair above U+FFFF), for channels that are not 8-bit clean.
 ///
 /// Both apply to everything written, [`RawValue`](crate::RawValue) text
-/// included (its strings are escaped the same way). Every format writes
+/// included (its strings are escaped the same way).
+///
+/// Two options change the text of floats written from Rust values
+/// ([`ValueWriter::f64`](crate::ValueWriter::f64) and
+/// [`f32`](crate::ValueWriter::f32)), for output that must match another
+/// writer's byte for byte: [`exponent_plus`](Self::exponent_plus) writes
+/// `1e+16` for `1e16`, and [`even_ties`](Self::even_ties) changes which of
+/// two equally close shortest texts is written. A [`Number`](crate::Number)
+/// keeps its own text in every format. Every format writes
 /// valid JSON that reads back as the same value (for objects without
 /// repeated keys: the writers do not check for them; see
 /// [`ObjectWriter`](crate::ObjectWriter)); the formats differ only in
@@ -46,6 +54,8 @@ pub struct Format {
     pub(crate) indent: u8,
     pub(crate) ascii: bool,
     pub(crate) html: bool,
+    pub(crate) exponent_plus: bool,
+    pub(crate) even_ties: bool,
 }
 
 impl Format {
@@ -65,6 +75,8 @@ impl Format {
             indent: 2,
             ascii: false,
             html: false,
+            exponent_plus: false,
+            even_ties: false,
         }
     }
 
@@ -137,6 +149,54 @@ impl Format {
         self
     }
 
+    /// Whether to write the `+` of a positive exponent in float text:
+    /// `1e+16` rather than `1e16`, as `serde_json` (1.0.147 and later),
+    /// JavaScript and Python write it. Negative exponents always have their
+    /// `-`; floats from 1e-5 up to below 1e16 are written as decimals and
+    /// have no exponent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{to_string_with, Format};
+    ///
+    /// let plus = Format::compact().exponent_plus(true);
+    /// assert_eq!(to_string_with(&[1e16, 2.5e-7, 0.5], plus), "[1e+16,2.5e-7,0.5]");
+    /// assert_eq!(to_string_with(&1e16, Format::compact()), "1e16");
+    /// ```
+    #[must_use]
+    pub const fn exponent_plus(mut self, on: bool) -> Self {
+        self.exponent_plus = on;
+        self
+    }
+
+    /// Whether an exact tie in float text goes to the even digit.
+    ///
+    /// A float is written as the shortest decimal that reads back as it, and
+    /// of those the closest. Rarely two are equally close (the float lies
+    /// exactly halfway between them; it takes 16 or 17 significant digits
+    /// for an `f64`). Both read back as the same float. By default the higher
+    /// one is written, as Rust's own formatting (`{}`, `{:e}`) picks it; with
+    /// this option, the one whose last digit is even, as `serde_json`, Java,
+    /// JavaScript and Python pick it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{to_string_with, Format};
+    ///
+    /// // 164696460098373.625 lies exactly between ...373.62 and ...373.63.
+    /// let x = 164_696_460_098_373.625_f64;
+    /// assert_eq!(to_string_with(&x, Format::compact()), "164696460098373.63");
+    /// assert_eq!(to_string_with(&x, Format::compact().even_ties(true)), "164696460098373.62");
+    /// assert_eq!(format!("{x}"), "164696460098373.63");
+    /// ```
+    #[must_use]
+    pub const fn even_ties(mut self, on: bool) -> Self {
+        self.even_ties = on;
+        self
+    }
+
     /// Whether this is an indented layout.
     ///
     /// # Examples
@@ -148,6 +208,16 @@ impl Format {
     #[must_use]
     pub const fn is_pretty(&self) -> bool {
         self.pretty
+    }
+
+    /// How an exact tie in float text is broken.
+    #[inline]
+    pub(crate) const fn ties(&self) -> crate::float::Ties {
+        if self.even_ties {
+            crate::float::Ties::Even
+        } else {
+            crate::float::Ties::Up
+        }
     }
 
     /// Whether strings need more than the minimal escaping.

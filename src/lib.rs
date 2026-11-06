@@ -110,6 +110,7 @@ mod decode;
 mod dupes;
 mod encode;
 mod error;
+mod float;
 mod format;
 mod lexer;
 mod limits;
