@@ -13,6 +13,57 @@
 
 ---
 
+## [0.5.1] - 2026-11-05
+
+Faster writing, the same bytes: floats are formatted in house instead of
+through `core`, strings with nothing to escape are copied in one piece, and
+the typed writer's small steps are inlined. Every default format writes
+exactly what 0.5.0 wrote. Two new `Format` options make float text match
+another writer's byte for byte.
+
+### Added
+
+- `Format::exponent_plus(bool)`: write the `+` of a positive exponent in
+  float text (`1e+16`), as `serde_json` 1.0.147 and later, JavaScript, and
+  Python write it.
+- `Format::even_ties(bool)`: when two shortest float texts are equally
+  close to the float (an exact tie, 16 or 17 significant digits), write the
+  one whose last digit is even, as `serde_json`, Java, JavaScript, and
+  Python do, instead of the higher one, as Rust's own formatting does (the
+  default). With both options on, floats are written as `serde_json`
+  writes them.
+- On-demand tests that compare the float formatter with `core` on every
+  `f32` and on a billion `f64`s (`cargo test --release --lib -- --ignored`).
+
+### Changed
+
+- Floats (`ValueWriter::f64`/`f32`, `Number::from_f64`, `Value::from(f64)`)
+  are formatted by an in-house implementation of Raffaello Giulietti's
+  Schubfach algorithm (integer arithmetic, one table of 617 128-bit powers
+  of ten, no `unsafe`) instead of `core`'s `{:e}` and a re-layout. The text
+  is unchanged: the same digits as `core`'s on every value tested (every
+  `f32`, a billion `f64`s, every exponent and boundary), and the same
+  layout. Writing a float takes about a third of the time.
+- `write_string`, and every string and key the writers write: a string
+  with nothing to escape is tested in whole words (one or two up to 16
+  bytes, 16 bytes per step beyond) and copied in one piece; one that needs
+  escaping is scanned from where that test stopped. The key path is always
+  inlined, so a literal key's test is done at compile time.
+- Integers are written two digits at a time and appended without a UTF-8
+  check of the digit buffer; `usize` and `isize` take the 64-bit path.
+- The typed writer's helpers (`member`, `member_with`, `optional`, `item`,
+  `item_with`, `object`, `array`) are inlined, and its constant pieces are
+  appended with constant-length pushes.
+- `to_string`, `to_string_pretty`, and `to_string_with` start with 128 bytes
+  of capacity instead of growing from 8.
+- Together, against 0.5.0: the 1 MiB benchmark document is written in 0.93
+  of the time compact and 0.72 pretty, typed structs in 0.56, a long
+  string with nothing to escape in 0.57; metrics-lib's JSON snapshot,
+  written with both new options, takes about 0.75 of `serde_json`'s time
+  (0.5.0: about 2.2 times). Numbers in the release notes.
+
+---
+
 ## [0.5.0] - 2026-10-19
 
 The implementation release: typed reading and writing through hand-written
@@ -254,7 +305,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jamesgober/jsonx-lib/compare/v0.2.0...v0.5.0
 [0.2.0]: https://github.com/jamesgober/jsonx-lib/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/jsonx-lib/releases/tag/v0.1.0

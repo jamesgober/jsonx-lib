@@ -34,8 +34,9 @@ const SPACES: &str = "                                                          
 ///
 /// So no string can end the literal early or put a raw line break in it,
 /// whatever it contains: the output is always exactly one JSON string token
-/// that decodes back to `text`. Unescaped stretches are copied in bulk, found
-/// eight bytes at a time.
+/// that decodes back to `text`. A string with nothing to escape (most keys
+/// and values) is tested a word at a time and copied whole; otherwise the
+/// unescaped stretches are copied in bulk, found eight bytes at a time.
 ///
 /// # Examples
 ///
@@ -45,12 +46,28 @@ const SPACES: &str = "                                                          
 /// out.push('}');
 /// assert_eq!(out, r#"{"msg":"say \"hi\"\n\u2028"}"#);
 /// ```
+#[inline(always)]
 pub fn write_string(out: &mut String, text: &str) {
+    let plain = scan::plain_prefix_for_write(text.as_bytes());
+    if plain == text.len() {
+        out.reserve(text.len() + 2);
+        out.push('"');
+        out.push_str(text);
+        out.push('"');
+    } else {
+        write_string_escaped(out, text, plain);
+    }
+}
+
+/// [`write_string`] for a string with at least one byte that may need
+/// escaping, none of them in `text[..plain]`.
+#[inline(never)]
+fn write_string_escaped(out: &mut String, text: &str, plain: usize) {
     out.reserve(text.len() + 2);
     out.push('"');
     let bytes = text.as_bytes();
     let mut from = 0;
-    let mut at = 0;
+    let mut at = plain;
     loop {
         at = scan::find_write_special(bytes, at);
         let Some(&b) = bytes.get(at) else { break };
@@ -94,7 +111,7 @@ pub fn write_string(out: &mut String, text: &str) {
 /// Appends `text` as a JSON string literal escaped as `format` asks:
 /// [`write_string`] unless the format is [`html_safe`](Format::html_safe)
 /// or [`ascii`](Format::ascii).
-#[inline]
+#[inline(always)]
 pub(crate) fn write_str(out: &mut String, text: &str, format: Format) {
     if format.strict() {
         write_string_strict(out, text, format);
@@ -183,6 +200,13 @@ fn push_unicode_escape(out: &mut String, unit: u16) {
     }
 }
 
+/// The first allocation of [`to_string`] and its siblings: enough for a
+/// small document, so a short reply is allocated once instead of growing
+/// from eight bytes through four reallocations. A larger document grows by
+/// doubling from here; to allocate once for that too, size a buffer and
+/// use [`write_value_with`].
+const START: usize = 128;
+
 /// Serializes `value` as compact JSON: no whitespace at all.
 ///
 /// `value` is anything that implements [`ToJson`]: a [`Value`], or your own
@@ -202,7 +226,7 @@ fn push_unicode_escape(out: &mut String, unit: u16) {
 /// ```
 #[must_use]
 pub fn to_string<T: ToJson + ?Sized>(value: &T) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(START);
     write_value(&mut out, value);
     out
 }
@@ -221,7 +245,7 @@ pub fn to_string<T: ToJson + ?Sized>(value: &T) -> String {
 /// ```
 #[must_use]
 pub fn to_string_pretty<T: ToJson + ?Sized>(value: &T) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(START);
     write_value_pretty(&mut out, value);
     out
 }
@@ -269,7 +293,7 @@ pub fn write_value_pretty<T: ToJson + ?Sized>(out: &mut String, value: &T) {
 /// ```
 #[must_use]
 pub fn to_string_with<T: ToJson + ?Sized>(value: &T, format: Format) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(START);
     write_value_with(&mut out, value, format);
     out
 }

@@ -119,6 +119,66 @@ fn find_read_special_run(bytes: &[u8], from: usize, end: usize) -> usize {
     end
 }
 
+/// The lanes of `x` that may hold a [`is_write_special`] byte. Zero exactly
+/// when no lane does: a false positive needs a true match below it.
+#[inline(always)]
+const fn write_hits(x: u64) -> u64 {
+    read_hits(x) | lanes_equal(x, 0xE2)
+}
+
+/// How many leading bytes of `bytes` are known not to be
+/// [`is_write_special`]: `bytes.len()` exactly when none is, so the string
+/// can be copied between quotes as it is; otherwise at most the index of the
+/// first one, where the escaping scan can start.
+///
+/// Whole words, with no byte loop. Up to 16 bytes take one test: two
+/// overlapping words (or halves of one, from four bytes; from one to three,
+/// the first, middle and last byte padded with spaces). So a key or a short
+/// value costs one test, and for a literal key, inlined into the caller, the
+/// test folds away at compile time. Longer strings go 16 bytes per step out
+/// of line.
+#[inline(always)]
+pub(crate) fn plain_prefix_for_write(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    if n > 16 {
+        return plain_prefix_run(bytes);
+    }
+    let hits = if let (Some(lo), Some(hi)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        write_hits(u64::from_le_bytes(*lo)) | write_hits(u64::from_le_bytes(*hi))
+    } else if let (Some(lo), Some(hi)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        write_hits(u64::from(u32::from_le_bytes(*lo)) | u64::from(u32::from_le_bytes(*hi)) << 32)
+    } else if let (Some(&a), Some(&b), Some(&c)) = (bytes.first(), bytes.get(n / 2), bytes.last()) {
+        write_hits(u64::from_le_bytes([a, b, c, b' ', b' ', b' ', b' ', b' ']))
+    } else {
+        0
+    };
+    if hits == 0 { n } else { 0 }
+}
+
+/// [`plain_prefix_for_write`] past 16 bytes: two words per step, one branch,
+/// then the last 16 bytes (overlapping what was tested).
+#[inline(never)]
+fn plain_prefix_run(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    let block_hits = |block: &[u8; 16]| match (block.first_chunk::<8>(), block.last_chunk::<8>()) {
+        (Some(lo), Some(hi)) => {
+            write_hits(u64::from_le_bytes(*lo)) | write_hits(u64::from_le_bytes(*hi))
+        }
+        _ => 1,
+    };
+    let mut i = 0;
+    while i + 16 <= n {
+        match bytes.get(i..).and_then(<[u8]>::first_chunk::<16>) {
+            Some(block) if block_hits(block) == 0 => i += 16,
+            _ => return i,
+        }
+    }
+    match bytes.last_chunk::<16>() {
+        Some(block) if block_hits(block) == 0 => n,
+        _ => i,
+    }
+}
+
 /// The index of the first byte at or after `from` that is
 /// [`is_write_special`], or `bytes.len()` if there is none.
 #[inline]
@@ -269,6 +329,32 @@ mod tests {
     }
 
     #[test]
+    fn test_plain_prefix_every_length_and_position() {
+        for len in 0..70 {
+            let plain = alloc::vec![b'a'; len];
+            assert_eq!(plain_prefix_for_write(&plain), len, "{len}");
+            for at in 0..len {
+                for special in [b'"', b'\\', 0, 0x1f, 0xE2] {
+                    let mut bytes = plain.clone();
+                    if let Some(slot) = bytes.get_mut(at) {
+                        *slot = special;
+                    }
+                    let prefix = plain_prefix_for_write(&bytes);
+                    assert!(prefix <= at, "{len} {at} {special}: {prefix}");
+                }
+                // Bytes next to the special ones in value are plain.
+                for other in [b' ', b'#', b'[', b']', 0x7f, 0x80, 0xE1, 0xE3, 0xFF] {
+                    let mut bytes = plain.clone();
+                    if let Some(slot) = bytes.get_mut(at) {
+                        *slot = other;
+                    }
+                    assert_eq!(plain_prefix_for_write(&bytes), len, "{len} {at} {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_hex_helpers() {
         assert_eq!(hex_value(b'0'), Some(0));
         assert_eq!(hex_value(b'f'), Some(15));
@@ -315,6 +401,10 @@ mod tests {
             let end = end.max(from);
             prop_assert_eq!(find_read_special(&bytes, from, end), naive_read(&bytes, from, end));
             prop_assert_eq!(find_write_special(&bytes, from), naive_write(&bytes, from));
+            let first = naive_write(&bytes, 0);
+            let prefix = plain_prefix_for_write(&bytes);
+            prop_assert!(prefix <= first);
+            prop_assert_eq!(prefix == bytes.len(), first == bytes.len());
         }
     }
 }

@@ -161,7 +161,11 @@ impl<'w> ValueWriter<'w> {
     /// ```
     #[inline]
     pub fn bool(mut self, value: bool) -> Written {
-        self.out.buf.push_str(if value { "true" } else { "false" });
+        if value {
+            self.out.buf.push_str("true");
+        } else {
+            self.out.buf.push_str("false");
+        }
         self.out.done()
     }
 
@@ -231,7 +235,7 @@ impl<'w> ValueWriter<'w> {
     /// ```
     #[inline]
     pub fn f64(mut self, value: f64) -> Written {
-        if !number::write_f64(self.out.buf, value) {
+        if !number::write_f64_as(self.out.buf, value, self.out.format) {
             self.out.buf.push_str("null");
         }
         self.out.done()
@@ -247,7 +251,7 @@ impl<'w> ValueWriter<'w> {
     /// ```
     #[inline]
     pub fn f32(mut self, value: f32) -> Written {
-        if !number::write_f32(self.out.buf, value) {
+        if !number::write_f32_as(self.out.buf, value, self.out.format) {
             self.out.buf.push_str("null");
         }
         self.out.done()
@@ -390,6 +394,7 @@ impl<'w> ValueWriter<'w> {
     /// assert_eq!(jsonx_lib::to_string(&p), r#"{"line":3,"character":14}"#);
     /// assert_eq!(jsonx_lib::to_string_pretty(&p), "{\n  \"line\": 3,\n  \"character\": 14\n}");
     /// ```
+    #[inline]
     pub fn object(mut self, members: impl FnOnce(&mut ObjectWriter<'_>)) -> Written {
         self.out.buf.push('{');
         let depth = self.out.depth;
@@ -422,6 +427,7 @@ impl<'w> ValueWriter<'w> {
     ///
     /// assert_eq!(jsonx_lib::to_string(&Range { start: 1, end: 4 }), "[1,4]");
     /// ```
+    #[inline]
     pub fn array(mut self, items: impl FnOnce(&mut ArrayWriter<'_>)) -> Written {
         self.out.buf.push('[');
         let depth = self.out.depth;
@@ -436,6 +442,7 @@ impl<'w> ValueWriter<'w> {
 
     /// Closes a container: on its own line in the pretty layout, unless it
     /// is empty (`[]`, `{}`).
+    #[inline]
     fn close(mut self, empty: bool, bracket: char) -> Written {
         if !empty && self.out.format.pretty {
             write::newline(self.out.buf, self.out.depth, self.out.format);
@@ -458,6 +465,10 @@ pub struct ObjectWriter<'w> {
 
 impl ObjectWriter<'_> {
     /// Writes the separator, the indentation, and the key with its colon.
+    /// Always inlined, down to the string's scan: keys are mostly literals,
+    /// and inlined into the caller the scan of a literal is done by the
+    /// compiler.
+    #[inline(always)]
     fn key(&mut self, key: &str) {
         if !self.first {
             self.out.buf.push(',');
@@ -467,9 +478,13 @@ impl ObjectWriter<'_> {
             write::newline(self.out.buf, self.out.depth, self.out.format);
         }
         write::write_str(self.out.buf, key, self.out.format);
-        self.out
-            .buf
-            .push_str(if self.out.format.pretty { ": " } else { ":" });
+        // Two calls, not one with a length chosen at run time: each is a
+        // constant store.
+        if self.out.format.pretty {
+            self.out.buf.push_str(": ");
+        } else {
+            self.out.buf.push(':');
+        }
     }
 
     /// Adds the member `key: value`. An `Option` that is `None` is written as
@@ -496,6 +511,7 @@ impl ObjectWriter<'_> {
     /// let reply = Reply { id: 1, result: None };
     /// assert_eq!(jsonx_lib::to_string(&reply), r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
     /// ```
+    #[inline]
     pub fn member<T: ToJson + ?Sized>(&mut self, key: &str, value: &T) {
         self.key(key);
         let depth = self.out.depth;
@@ -527,6 +543,7 @@ impl ObjectWriter<'_> {
     /// let full = Item { label: "x".into(), detail: Some("fn x()".into()) };
     /// assert_eq!(jsonx_lib::to_string(&full), r#"{"label":"x","detail":"fn x()"}"#);
     /// ```
+    #[inline]
     pub fn optional<T: ToJson + ?Sized>(&mut self, key: &str, value: &T) {
         if !value.is_absent() {
             self.member(key, value);
@@ -558,6 +575,7 @@ impl ObjectWriter<'_> {
     /// let h = Hover { markdown: "**x**".into() };
     /// assert_eq!(jsonx_lib::to_string(&h), r#"{"contents":{"kind":"markdown","value":"**x**"}}"#);
     /// ```
+    #[inline]
     pub fn member_with(&mut self, key: &str, value: impl FnOnce(ValueWriter<'_>) -> Written) {
         self.key(key);
         let depth = self.out.depth;
@@ -574,6 +592,7 @@ pub struct ArrayWriter<'w> {
 impl ArrayWriter<'_> {
     /// Writes the separator and the indentation, and returns the writer for
     /// the item.
+    #[inline]
     fn next(&mut self) -> ValueWriter<'_> {
         if !self.first {
             self.out.buf.push(',');
@@ -604,6 +623,7 @@ impl ArrayWriter<'_> {
     /// }
     /// assert_eq!(jsonx_lib::to_string(&Pair("x", -1)), r#"["x",-1]"#);
     /// ```
+    #[inline]
     pub fn item<T: ToJson + ?Sized>(&mut self, value: &T) {
         let Written(()) = value.to_json(self.next());
     }
@@ -627,6 +647,7 @@ impl ArrayWriter<'_> {
     /// }
     /// assert_eq!(jsonx_lib::to_string(&Squares(3)), "[1,4,9]");
     /// ```
+    #[inline]
     pub fn item_with(&mut self, value: impl FnOnce(ValueWriter<'_>) -> Written) {
         let Written(()) = value(self.next());
     }
@@ -848,15 +869,22 @@ to_json_integer!(
 impl ToJson for isize {
     #[inline]
     fn to_json(&self, out: ValueWriter<'_>) -> Written {
-        // `isize` fits `i128` on every target.
-        out.i128(*self as i128)
+        // 64 bits or fewer on every target Rust supports today, so the
+        // 128-bit path is compiled out; it stays for a wider target.
+        match i64::try_from(*self) {
+            Ok(n) => out.i64(n),
+            Err(_) => out.i128(*self as i128),
+        }
     }
 }
 
 impl ToJson for usize {
     #[inline]
     fn to_json(&self, out: ValueWriter<'_>) -> Written {
-        out.u128(*self as u128)
+        match u64::try_from(*self) {
+            Ok(n) => out.u64(n),
+            Err(_) => out.u128(*self as u128),
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 # jsonx-lib &mdash; API Reference
 
 > Complete reference for every public item in `jsonx-lib`, with examples.
-> **Status: 0.5.0, pre-1.0.** The surface is designed across the 0.x series
+> **Status: 0.5.1, pre-1.0.** The surface is designed across the 0.x series
 > and frozen at `1.0.0`, after lsp-lang and the LexerSketch API have used it.
 > See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -1250,7 +1250,7 @@ assert_eq!(v.to_string(), r#"{"id":1,"params":{"line":3,"flags":[true,null,-1.5]
 ```text
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub struct Format { /* layout, escaping */ }
+pub struct Format { /* layout, escaping, float text */ }
 ```
 
 | Item | Description |
@@ -1260,12 +1260,30 @@ pub struct Format { /* layout, escaping */ }
 | `const fn with_indent(self, spaces: u8)` | The indented layout, `spaces` per level. |
 | `const fn html_safe(self, bool)` | Also escape `<`, `>`, `&` (for JSON inside HTML). |
 | `const fn ascii(self, bool)` | Escape every non-ASCII character (surrogate pairs above U+FFFF). |
+| `const fn exponent_plus(self, bool)` | Write the `+` of a positive exponent in float text: `1e+16` rather than `1e16`. |
+| `const fn even_ties(self, bool)` | When two shortest float texts are equally close to the float, write the one whose last digit is even, not the higher one. |
 | `const fn is_pretty(&self)` | Whether indented. |
 
 Every format writes valid JSON that reads back as the same value, raw
 values included (see [`RawValue`](#rawvalue)), for objects without repeated
 keys: neither the value writers nor the [`Writer`](#writer) check keys for
 repeats.
+
+The two float options change only floats written from Rust values
+(`ValueWriter::f64` and `f32`, so also `f64` and `f32` fields and items);
+a `Number` keeps its own text. They exist for output that must match
+another writer byte for byte. With both on, floats are written as
+`serde_json` (1.0.147 and later) writes them:
+
+```rust
+use jsonx_lib::{to_string_with, Format};
+
+let like_serde_json = Format::compact().exponent_plus(true).even_ties(true);
+// 164696460098373.625 lies exactly halfway between ...373.62 and ...373.63.
+let x = [1e16, 2.5e-7, 164_696_460_098_373.625];
+assert_eq!(to_string_with(&x, like_serde_json), "[1e+16,2.5e-7,164696460098373.62]");
+assert_eq!(jsonx_lib::to_string(&x), "[1e16,2.5e-7,164696460098373.63]");
+```
 
 ```rust
 use jsonx_lib::{json, to_string_with, Format};

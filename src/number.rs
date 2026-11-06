@@ -1,9 +1,9 @@
 //! JSON numbers, kept as their exact text.
 
 use alloc::{borrow::Cow, string::String};
-use core::fmt::{self, Write as _};
+use core::fmt;
 
-use crate::lexer;
+use crate::{Format, float, lexer};
 
 /// A JSON number, kept as the exact text of the document.
 ///
@@ -462,24 +462,8 @@ impl fmt::Debug for Number<'_> {
     }
 }
 
-/// A fixed buffer for `core::fmt` output, so formatting an `f64` needs no
-/// allocation before the final text is built.
-struct StackText {
-    buf: [u8; 40],
-    len: usize,
-}
-
-impl fmt::Write for StackText {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let end = self.len + s.len();
-        let slot = self.buf.get_mut(self.len..end).ok_or(fmt::Error)?;
-        slot.copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
-
 /// Pushes `count` ASCII zeros.
+#[cfg(test)]
 fn zeros(out: &mut String, count: usize) {
     out.extend(core::iter::repeat_n('0', count));
 }
@@ -489,20 +473,8 @@ fn zeros(out: &mut String, count: usize) {
 #[inline]
 pub(crate) fn write_u64(out: &mut String, value: u64) {
     let mut digits = [0u8; 20];
-    let mut at = digits.len();
-    let mut rest = value;
-    loop {
-        at -= 1;
-        if let Some(slot) = digits.get_mut(at) {
-            // `rest % 10` is below 10.
-            *slot = b'0' + (rest % 10) as u8;
-        }
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
-    out.push_str(core::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or("0"));
+    let start = float::put_digits(&mut digits, 20, value);
+    float::push_ascii(out, digits.get(start..).unwrap_or_default());
 }
 
 /// Appends `value` in decimal.
@@ -550,68 +522,62 @@ fn format_f64(value: f64) -> Option<String> {
 /// Appends the shortest round-trip text for `value`, laid out as described
 /// on [`Number::from_f64`]. Returns `false`, writing nothing, for NaN and
 /// the infinities.
-///
-/// `core`'s `{:e}` formatting already yields the shortest digit string that
-/// reads back as the same `f64` (it is the same algorithm `Display` uses); this
-/// only moves the decimal point.
+#[inline]
 pub(crate) fn write_f64(out: &mut String, value: f64) -> bool {
+    write_f64_as(out, value, Format::compact())
+}
+
+/// [`write_f64`] with the float options of `format`: the `+` of a positive
+/// exponent, and how an exact tie is broken.
+pub(crate) fn write_f64_as(out: &mut String, value: f64, format: Format) -> bool {
     if !value.is_finite() {
         return false;
     }
-    let mut sci = StackText {
-        buf: [0; 40],
-        len: 0,
-    };
-    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+    let decimal = float::f64_decimal(value, format.ties());
+    float::write_decimal(out, value.is_sign_negative(), decimal, format.exponent_plus);
+    true
 }
 
 /// As [`write_f64`] for an `f32`: the shortest text that reads back as the
 /// same `f32` (`0.1f32` is `0.1`, not the `0.10000000149011612` of its
 /// widening to `f64`).
+#[cfg(test)]
 pub(crate) fn write_f32(out: &mut String, value: f32) -> bool {
+    write_f32_as(out, value, Format::compact())
+}
+
+/// [`write_f32`] with the float options of `format`.
+pub(crate) fn write_f32_as(out: &mut String, value: f32, format: Format) -> bool {
     if !value.is_finite() {
         return false;
     }
-    let mut sci = StackText {
-        buf: [0; 40],
-        len: 0,
-    };
-    write!(sci, "{value:e}").is_ok() && layout(out, &sci)
+    let decimal = float::f32_decimal(value, format.ties());
+    float::write_decimal(out, value.is_sign_negative(), decimal, format.exponent_plus);
+    true
 }
 
-/// Lays out `{:e}` text (`-1.5e-7`) as JSON, decimals for exponents from -5
-/// up to 15 and exponent form otherwise. Writes nothing and returns `false`
-/// if `sci` is not in that form (it always is).
-fn layout(out: &mut String, sci: &StackText) -> bool {
-    let Some(sci) = sci
-        .buf
-        .get(..sci.len)
-        .and_then(|b| core::str::from_utf8(b).ok())
-    else {
-        return false;
-    };
+/// The text 0.5.0 wrote, kept as the reference the tests compare with:
+/// `core`'s `{:e}` digits, laid out with decimals for exponents from -5 up
+/// to 15 and exponent form otherwise.
+#[cfg(test)]
+pub(crate) fn core_text(sci: &str) -> String {
+    let mut out = String::new();
     let (negative, sci) = match sci.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, sci),
     };
-    let Some((mantissa, exponent)) = sci.split_once('e') else {
-        return false;
-    };
-    let Ok(exponent) = exponent.parse::<i32>() else {
-        return false;
-    };
-    // `{:e}` writes one digit before the point.
+    let (mantissa, exponent) = sci.split_once('e').unwrap_or((sci, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
     let (lead, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if negative {
         out.push('-');
     }
     if (-5..16).contains(&exponent) {
         if let Ok(point) = usize::try_from(exponent) {
-            // `point` digits of `frac` go before the decimal point.
             out.push_str(lead);
             if frac.len() <= point {
                 out.push_str(frac);
-                zeros(out, point - frac.len());
+                zeros(&mut out, point - frac.len());
                 out.push_str(".0");
             } else {
                 let (int, rest) = frac.split_at_checked(point).unwrap_or((frac, ""));
@@ -621,7 +587,7 @@ fn layout(out: &mut String, sci: &StackText) -> bool {
             }
         } else {
             out.push_str("0.");
-            zeros(out, exponent.unsigned_abs() as usize - 1);
+            zeros(&mut out, exponent.unsigned_abs() as usize - 1);
             out.push_str(lead);
             out.push_str(frac);
         }
@@ -632,10 +598,11 @@ fn layout(out: &mut String, sci: &StackText) -> bool {
             out.push_str(frac);
         }
         out.push('e');
-        write_i64(out, i64::from(exponent));
+        out.push_str(&alloc::format!("{exponent}"));
     }
-    true
+    out
 }
+
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
@@ -823,7 +790,59 @@ mod tests {
         assert!(!write_f64(&mut out, f64::INFINITY));
     }
 
+    #[test]
+    fn test_float_options_through_format() {
+        let both = Format::compact().exponent_plus(true).even_ties(true);
+        let tie = 164_696_460_098_373.0 + 0.625;
+        let text = |x: f64, format: Format| {
+            let mut out = String::new();
+            assert!(write_f64_as(&mut out, x, format));
+            out
+        };
+        assert_eq!(text(1e16, both), "1e+16");
+        assert_eq!(text(-1e-7, both), "-1e-7");
+        assert_eq!(text(tie, both), "164696460098373.62");
+        assert_eq!(
+            text(tie, Format::compact().exponent_plus(true)),
+            "164696460098373.63"
+        );
+        assert_eq!(text(1e300, Format::pretty().exponent_plus(true)), "1e+300");
+        let mut out = String::new();
+        assert!(write_f32_as(&mut out, 1e20, both));
+        assert_eq!(out, "1e+20");
+        assert!(!write_f32_as(&mut out, f32::INFINITY, both));
+        assert!(!write_f64_as(&mut out, f64::NAN, both));
+        assert_eq!(out, "1e+20");
+        // The options ride along with the other settings.
+        let f = Format::compact()
+            .html_safe(true)
+            .exponent_plus(true)
+            .even_ties(true);
+        assert!(f.exponent_plus && f.even_ties && f.html && !f.pretty);
+        assert_eq!(Format::default(), Format::compact());
+        assert_ne!(both, Format::compact());
+    }
+
     proptest! {
+        /// With both float options on, the text is still one valid JSON
+        /// number that reads back as the same float; the `+` alone is the
+        /// only difference `exponent_plus` makes.
+        #[test]
+        fn prop_float_options_keep_the_value(bits in any::<u64>()) {
+            let x = f64::from_bits(bits);
+            prop_assume!(x.is_finite());
+            let both = Format::compact().exponent_plus(true).even_ties(true);
+            let mut out = String::new();
+            prop_assert!(write_f64_as(&mut out, x, both));
+            prop_assert!(lexer::is_number(&out), "{}", out);
+            prop_assert_eq!(out.parse::<f64>().map(f64::to_bits).ok(), Some(x.to_bits()));
+            let mut plain = String::new();
+            prop_assert!(write_f64_as(&mut plain, x, Format::compact().exponent_plus(true)));
+            let mut default = String::new();
+            prop_assert!(write_f64(&mut default, x));
+            prop_assert_eq!(plain.replacen("e+", "e", 1), default);
+        }
+
         #[test]
         fn prop_f32_text_round_trips(bits in any::<u32>()) {
             let x = f32::from_bits(bits);
