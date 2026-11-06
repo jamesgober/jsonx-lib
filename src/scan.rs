@@ -146,7 +146,7 @@ pub(crate) fn plain_prefix_for_write(bytes: &[u8]) -> usize {
     let hits = if let (Some(lo), Some(hi)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
         write_hits(u64::from_le_bytes(*lo)) | write_hits(u64::from_le_bytes(*hi))
     } else if let (Some(lo), Some(hi)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
-        write_hits(u64::from(u32::from_le_bytes(*lo)) | u64::from(u32::from_le_bytes(*hi)) << 32)
+        write_hits(u64::from(u32::from_le_bytes(*lo)) | (u64::from(u32::from_le_bytes(*hi)) << 32))
     } else if let (Some(&a), Some(&b), Some(&c)) = (bytes.first(), bytes.get(n / 2), bytes.last()) {
         write_hits(u64::from_le_bytes([a, b, c, b' ', b' ', b' ', b' ', b' ']))
     } else {
