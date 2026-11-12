@@ -64,7 +64,7 @@ Moved to a later phase (anti-deferral rule):
   covers the same ground with proptest: arbitrary bytes, JSON-like token soup,
   and mutated valid documents through every entry point, never panicking.
 
-Open for the coordinator (a design question, not deferred work):
+Still open (a design question, not deferred work):
 - lsp-lang uses `serde` derives (`Deserialize` into borrowed structs,
   `Serialize` for replies) and re-exports `serde_json::{Value, json}` in its
   public API. DIRECTIVES §1 rules out reflection-based mapping, so dropping
