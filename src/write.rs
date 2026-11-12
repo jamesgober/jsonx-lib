@@ -158,7 +158,8 @@ fn write_string_strict(out: &mut String, text: &str, format: Format) {
 }
 
 /// Appends `raw`, the text of one valid JSON value, in `format`: unchanged
-/// in the plain formats; under a strict one, with every character that
+/// in the plain formats (U+2028 and U+2029 included, which
+/// [`write_string`] escapes); under a strict one, with every character that
 /// format escapes in strings (`<`, `>`, `&` when HTML-safe, anything
 /// non-ASCII when ASCII-only, U+2028 and U+2029 in both) written as its
 /// `\uXXXX` escape. In valid JSON those characters can only occur inside
@@ -234,6 +235,15 @@ pub fn to_string<T: ToJson + ?Sized>(value: &T) -> String {
 /// Serializes `value` as indented JSON: two spaces per level, one member or
 /// item per line, `": "` after keys, empty containers as `[]` and `{}`, and
 /// no trailing newline.
+///
+/// Every line is indented by its depth, so the output grows with the square
+/// of the nesting depth: about `2 * depth * depth` bytes of indentation for
+/// a value nested `depth` levels, where compact output takes `2 * depth`
+/// bytes. Under the default [`Limits`](crate::Limits) a parsed value is at
+/// most 128 levels deep, which keeps this small; a value parsed with
+/// [`Limits::unlimited`](crate::Limits::unlimited) or built in code can be
+/// nested deeply enough that its pretty text does not fit in memory. Write
+/// such a value compactly.
 ///
 /// # Examples
 ///

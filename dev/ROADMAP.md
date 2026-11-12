@@ -194,6 +194,27 @@ Decided (anti-deferral rule):
 - **No pre-checked key type.** Inlining the key path gives literal keys the
   same saving without new API.
 
+## v0.5.2 - Reader fixes (DONE, 2026-11-12)
+- [x] `StreamReader` documents mode: `max_input_bytes` per document, not per
+  stream, so a long-lived NDJSON feed is not refused for its total.
+- [x] `Limits::max_value_bytes`: a bound on what a pending whole-value call
+  of the stream reader holds, separate from the input budget.
+- [x] The whole-value calls refuse input after a single document
+  (`TrailingCharacters`); `StreamReader::finish` checks the rest of the input.
+- [x] `find_pointer` under `DuplicateKeys::Last` takes the last member, as
+  `parse` does.
+- [x] `DecodeError` messages escape control and formatting characters in
+  keys and cut long keys; `path()` and `pointer()` stay exact.
+
+Decided (anti-deferral rule):
+- **Raw text keeps U+2028 and U+2029 in the plain formats.** Escaping them
+  there would change output bytes of the default format, which a patch
+  release keeps as they were; documented on `Format` instead, with
+  `html_safe` as the format for JavaScript source.
+- **`Object` lookups stay linear.** Documented on `insert` and `entry`; a
+  hash index for large objects can be added beside the vector later
+  (see JX-API-01 above).
+
 ## v0.9.0 - Hardening
 - [x] Fuzz targets (delivered in 0.5, see above).
 - [ ] Long fuzz campaigns with a kept corpus.

@@ -16,7 +16,7 @@ use alloc::{
     string::String,
     vec::Vec,
 };
-use core::fmt;
+use core::fmt::{self, Write as _};
 
 use crate::{
     Array, DuplicateKeys, Kind, Limits, Number, Numbers, Object, Parser, Reader, ToJson, Value,
@@ -154,6 +154,14 @@ struct Inner {
 /// what [`Display`](fmt::Display) shows after the offset:
 /// `expected u32, found string at byte 31 (at /position/line)`. That is a
 /// ready-made message for a JSON-RPC `-32602 Invalid params` reply.
+///
+/// The keys in the path come from the input, so the message shows them
+/// made safe to log: a control character, a line or paragraph separator,
+/// or a bidirectional formatting character is written as its Rust escape
+/// (`\u{a}` for a newline), a backslash as `\\`, and a key longer than 64
+/// characters is cut there and ends in `...`. The message is therefore
+/// always one line, and its length is bounded by the depth of the path.
+/// [`path`](Self::path) and [`pointer`](Self::pointer) keep every key exact.
 ///
 /// The error is one pointer wide, so `Result<T, DecodeError>` stays small.
 ///
@@ -391,13 +399,62 @@ impl From<Error> for DecodeError {
 }
 
 impl fmt::Display for DecodeError {
+    /// The message, with the path's keys made safe to log (see
+    /// [`DecodeError`]).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} at byte {}", self.0.kind, self.0.offset)?;
         if !self.0.path.is_empty() {
-            write!(f, " (at {})", self.pointer())?;
+            f.write_str(" (at ")?;
+            for segment in &self.0.path {
+                f.write_char('/')?;
+                match segment {
+                    PathSegment::Key(key) => write_message_key(f, key)?,
+                    PathSegment::Index(index) => write!(f, "{index}")?,
+                }
+            }
+            f.write_char(')')?;
         }
         Ok(())
     }
+}
+
+/// The most characters of one key that a [`DecodeError`] message shows.
+const MESSAGE_KEY_CHARS: usize = 64;
+
+/// Writes `key` as a segment of the pointer in a [`DecodeError`] message:
+/// escaped as RFC 6901 escapes it, with every character that could break a
+/// log line or hide text escaped too, and cut after
+/// [`MESSAGE_KEY_CHARS`] characters.
+fn write_message_key(f: &mut fmt::Formatter<'_>, key: &str) -> fmt::Result {
+    for (count, ch) in key.chars().enumerate() {
+        if count == MESSAGE_KEY_CHARS {
+            return f.write_str("...");
+        }
+        match ch {
+            '~' => f.write_str("~0")?,
+            '/' => f.write_str("~1")?,
+            '\\' => f.write_str("\\\\")?,
+            _ if hides_text(ch) => write!(f, "{}", ch.escape_unicode())?,
+            _ => f.write_char(ch)?,
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ch` can break a line of text or hide part of it when shown:
+/// control characters, the line and paragraph separators, and the
+/// bidirectional formatting characters.
+fn hides_text(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 impl core::error::Error for DecodeError {}

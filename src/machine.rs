@@ -155,6 +155,9 @@ pub(crate) struct Machine {
     pub(crate) copy_keys: bool,
     /// Read a sequence of documents: after one ends, another may follow.
     pub(crate) documents: bool,
+    /// Where the current document began, in the whole input (0 for the
+    /// first, and outside documents mode).
+    doc_start: usize,
     /// How typed reads take integers.
     pub(crate) numbers: crate::Numbers,
     objects: SmallStack<OpenObject, INLINE_OBJECTS>,
@@ -187,6 +190,7 @@ impl Machine {
             pending: Pending::None,
             copy_keys: false,
             documents: false,
+            doc_start: 0,
             numbers: crate::Numbers::IntegerText,
             objects: SmallStack::new(OpenObject {
                 keys: 0,
@@ -224,6 +228,35 @@ impl Machine {
     #[inline]
     pub(crate) fn finish_iteration(&mut self) {
         self.state = State::Done;
+    }
+
+    /// Where the input of the current document is counted from, in the
+    /// whole input: where it began or, in documents mode between two
+    /// documents, just past what has been consumed (what is after it belongs
+    /// to the next one). Always 0 outside documents mode.
+    pub(crate) fn document_start(&self) -> usize {
+        if self.documents && self.state == State::End && matches!(self.pending, Pending::None) {
+            self.dropped + self.pos
+        } else {
+            self.doc_start
+        }
+    }
+
+    /// After [`at_value`](Self::at_value) answered that no value comes
+    /// next: at the end of a single document, the answer [`step`](Self::step)
+    /// gives there. Anything but whitespace after it is
+    /// [`ErrorKind::TrailingCharacters`]; over a partial text, whitespace so
+    /// far is [`ErrorKind::UnexpectedEnd`] (more input may still follow).
+    pub(crate) fn check_trailing(&self, src: &str) -> Result<(), Error> {
+        if self.state == State::End && !self.documents {
+            if self.pos < src.len() {
+                return Err(Error::new(ErrorKind::TrailingCharacters, self.pos));
+            }
+            if !self.complete {
+                return Err(Self::end_error(src));
+            }
+        }
+        Ok(())
     }
 
     /// The first byte the machine may still need: the start of a token in
@@ -513,10 +546,12 @@ impl Machine {
         }
     }
 
-    /// Starts the next document of a sequence: its own element budget.
+    /// Starts the next document of a sequence, at the current position: its
+    /// own element budget, and (for a stream) its own input budget.
     fn next_document(&mut self) {
         self.state = State::Value;
         self.elements = 0;
+        self.doc_start = self.dropped + self.pos;
     }
 
     /// The state after a value completes in the current container.

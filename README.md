@@ -236,8 +236,9 @@ paired samples so load hits both versions alike; time is 0.5's over 0.2's,
 On the 1 MiB benchmark document (`cargo bench --bench bench`): `parse` about
 220 MiB/s, events about 510 MiB/s, `read_raw` about 610 MiB/s, `to_string`
 about 1.05 GiB/s, typed decoding into structs about 300 MiB/s, and the
-incremental reader about 395 MiB/s. Typed decoding of a small request is
-2.3 to 2.6 times serde_json's derive (median about 2.5) and allocates nothing. Method and every
+incremental reader about 395 MiB/s. Typed decoding of a small request
+takes 2.3 to 2.6 times as long as serde_json's derive (median about 2.5
+times) and allocates nothing. Method and every
 number: [the release notes](./docs/release/v0.5.0.md#benchmarks).
 
 0.5.1 made writing faster without changing a byte of output: typed
@@ -251,7 +252,7 @@ third; metrics-lib's JSON snapshot is written in about 0.75 of
 ## Documentation
 
 - [API reference](./docs/API.md): every public item, with examples, and a guide to moving a JSON-RPC server off serde_json.
-- Release notes for [0.5.1](./docs/release/v0.5.1.md), [0.5.0](./docs/release/v0.5.0.md), and [0.2.0](./docs/release/v0.2.0.md).
+- Release notes for [0.5.2](./docs/release/v0.5.2.md), [0.5.1](./docs/release/v0.5.1.md), [0.5.0](./docs/release/v0.5.0.md), and [0.2.0](./docs/release/v0.2.0.md).
 - [Roadmap](./dev/ROADMAP.md) and [engineering directives](./dev/DIRECTIVES.md).
 - Examples: `cargo run --example quick_start`, `rpc_envelope`, `typed_lsp`.
 

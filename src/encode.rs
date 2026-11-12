@@ -289,7 +289,12 @@ impl<'w> ValueWriter<'w> {
 
     /// Writes a [`RawValue`]'s text: already valid JSON, so it is not
     /// checked again. In the plain formats it is copied unchanged (in the
-    /// pretty layout it keeps its own spacing). Under
+    /// pretty layout it keeps its own spacing), U+2028 and U+2029 inside
+    /// its strings included: valid JSON, though
+    /// [`write_string`](crate::write_string) escapes them in the strings it
+    /// writes, for JavaScript before ES2019. For text that will be pasted
+    /// into JavaScript source, use [`Format::html_safe`](crate::Format::html_safe),
+    /// which escapes them in raw text too. Under
     /// [`Format::html_safe`](crate::Format::html_safe) or
     /// [`Format::ascii`](crate::Format::ascii), the characters that format
     /// escapes are escaped inside the raw text's strings too (the only place

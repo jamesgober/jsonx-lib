@@ -158,6 +158,11 @@ impl<'a> Object<'a> {
     /// member keeps its position and its old value is returned; otherwise the
     /// member is appended and `None` is returned.
     ///
+    /// The existing member is found by a linear scan, so building an object
+    /// of `n` members with `insert` costs `O(n^2)` comparisons. For a large
+    /// object whose keys you know to be distinct, use [`push`](Self::push),
+    /// or collect the members with [`FromIterator`].
+    ///
     /// # Examples
     ///
     /// ```
@@ -249,7 +254,8 @@ impl<'a> Object<'a> {
         self.members.sort_by(|(a, _), (b, _)| a.cmp(b));
     }
 
-    /// The member named `key`, to read, change, or insert in one lookup.
+    /// The member named `key`, to read, change, or insert in one lookup (a
+    /// linear scan, as for [`insert`](Self::insert)).
     ///
     /// # Examples
     ///

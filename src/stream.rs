@@ -119,10 +119,14 @@ const COMPACT_AT: usize = 4 * 1024;
 /// (Rust 2024 drops the `if let` temporaries before the `else`), or after
 /// the loop that drains the ready events, as below; a `match` keeps the
 /// event borrowed in every arm. Consumed input is dropped from the buffer as more
-/// is fed, so a long document read as it arrives needs memory for one token
-/// and one chunk, not for the document. A token cut by a chunk boundary is
-/// continued where it stopped, never scanned again from its start: a string
-/// fed one byte at a time costs linear time.
+/// is fed, so a long document read with [`next_event`](Self::next_event) as
+/// it arrives needs memory for one token and one chunk, not for the
+/// document. The whole-value calls ([`read_raw`](Self::read_raw),
+/// [`read_value`](Self::read_value), [`decode`](Self::decode)) are
+/// different: each keeps its value's text in the buffer until the value
+/// ends, bounded by [`Limits::max_value_bytes`]. A token cut by a chunk
+/// boundary is continued where it stopped, never scanned again from its
+/// start: a string fed one byte at a time costs linear time.
 ///
 /// The input must be UTF-8, checked as it arrives (a character may be split
 /// across chunks). The first invalid byte is reported as
@@ -132,9 +136,11 @@ const COMPACT_AT: usize = 4 * 1024;
 /// syntax, so the two can name different errors for a document that has
 /// both.)
 ///
-/// [`Limits::max_input_bytes`] bounds the total fed; the other budgets apply
-/// exactly as for a complete document. After an error the reader is
-/// finished: every later call returns the same error.
+/// [`Limits::max_input_bytes`] bounds the total fed (in
+/// [`documents`](Self::documents) mode, what is fed for each document), and
+/// [`Limits::max_value_bytes`] what a whole-value call may hold; the other
+/// budgets apply exactly as for a complete document. After an error the
+/// reader is finished: every later call returns the same error.
 ///
 /// # Examples
 ///
@@ -228,6 +234,13 @@ impl StreamReader {
     /// return one document each, and `Ready(None)` once the input has ended
     /// after the last.
     ///
+    /// [`Limits::max_input_bytes`] then applies to each document, not to the
+    /// stream: input is counted from where the current document began (or,
+    /// between documents, from the end of the last one), so a connection
+    /// that carries documents for as long as it stays open is never refused
+    /// for its total. A [`Reader`](crate::Reader), which has its whole input
+    /// already, applies the budget to all of it.
+    ///
     /// # Examples
     ///
     /// ```
@@ -257,8 +270,11 @@ impl StreamReader {
     ///
     /// # Errors
     ///
-    /// [`ErrorKind::InputTooLarge`] when the input in total grows past
-    /// [`Limits::max_input_bytes`] (the reader is then finished);
+    /// [`ErrorKind::InputTooLarge`] when the input in total (in documents
+    /// mode, of the current document) grows past [`Limits::max_input_bytes`],
+    /// or when the value a pending whole-value call is reading grows past
+    /// [`Limits::max_value_bytes`], at the offset of the first byte over the
+    /// budget (the reader is then finished);
     /// [`ErrorKind::InputAfterEnd`] after [`end_input`](Self::end_input);
     /// any error the reader already stopped at.
     ///
@@ -278,11 +294,24 @@ impl StreamReader {
         if self.ended {
             return Err(Error::new(ErrorKind::InputAfterEnd, self.fed));
         }
+        // The input budget, from where the current document began (the
+        // start of the input outside documents mode).
+        let start = self.machine.document_start();
         let max = self.machine.limits.max_input_bytes;
-        if bytes.len() > max - self.fed {
-            let e = Error::new(ErrorKind::InputTooLarge, max);
-            self.failed = Some(e);
-            return Err(e);
+        if bytes.len() > max.saturating_sub(self.fed.saturating_sub(start)) {
+            let e = Error::new(ErrorKind::InputTooLarge, start.saturating_add(max));
+            return Err(*self.failed.insert(e));
+        }
+        // The value a whole-value call is waiting on stays in the buffer.
+        if let Some(progress) = self.raw {
+            let start = progress
+                .start
+                .unwrap_or(self.base + self.machine.needed_from());
+            let max = self.machine.limits.max_value_bytes;
+            if bytes.len() > max.saturating_sub(self.fed.saturating_sub(start)) {
+                let e = Error::new(ErrorKind::InputTooLarge, start.saturating_add(max));
+                return Err(*self.failed.insert(e));
+            }
         }
         self.fed += bytes.len();
         self.compact();
@@ -432,12 +461,21 @@ impl StreamReader {
     /// comes next.
     ///
     /// The value must be in the buffer whole before it can be returned, so
-    /// a large value costs memory for all of it. `NeedInput` keeps the
-    /// progress: the next call continues the same value.
+    /// a large value costs memory for all of it, whitespace included, up to
+    /// [`Limits::max_value_bytes`] (past it, [`feed`](Self::feed) refuses
+    /// more). `NeedInput` keeps the progress: the next call continues the
+    /// same value.
+    ///
+    /// After a single document's value, a call answers as
+    /// [`next_event`](Self::next_event) does there: `NeedInput` while only
+    /// whitespace has followed and the input has not ended, `Ready(None)`
+    /// once it has, and [`ErrorKind::TrailingCharacters`] for anything but
+    /// whitespace. [`finish`](Self::finish) makes the same check in one call.
     ///
     /// # Errors
     ///
-    /// As [`next_event`](Self::next_event), for any error inside the value.
+    /// As [`next_event`](Self::next_event), for any error inside the value,
+    /// and [`ErrorKind::TrailingCharacters`] after the document.
     ///
     /// # Examples
     ///
@@ -567,6 +605,57 @@ impl StreamReader {
             .decode(text)
             .map(|value| Step::Ready(Some(value)))
             .map_err(|e| e.shifted(start))
+    }
+
+    /// Reads to the end of the input, checking that the rest of the
+    /// document (in documents mode, of every document) is valid and that
+    /// nothing but whitespace follows: `Ready(())` once the input has ended
+    /// and all of it was read, `NeedInput` before that. As
+    /// [`Reader::finish`](crate::Reader::finish), for input that arrives in
+    /// pieces.
+    ///
+    /// The whole-value calls stop at the end of the value they read, and a
+    /// value nested in the document says nothing of the rest of it. Call
+    /// this after the last of them to know that the input held exactly one
+    /// valid document (or a sequence of valid ones).
+    ///
+    /// # Errors
+    ///
+    /// The first error in the rest of the input, as
+    /// [`next_event`](Self::next_event) reports it: a syntax error, an
+    /// exceeded budget, invalid UTF-8, or [`ErrorKind::TrailingCharacters`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{ErrorKind, Step, StreamReader};
+    ///
+    /// let mut r = StreamReader::new();
+    /// r.feed(br#"{"id": 1} "#)?;
+    /// assert!(r.read_value()?.is_ready());
+    /// assert_eq!(r.finish()?, Step::NeedInput); // more may follow
+    /// r.end_input();
+    /// assert_eq!(r.finish()?, Step::Ready(()));
+    ///
+    /// let mut r = StreamReader::new();
+    /// r.feed(br#"{"id": 1}}"#)?;
+    /// r.end_input();
+    /// assert!(r.read_value()?.is_ready());
+    /// let err = r.finish().unwrap_err();
+    /// assert_eq!((err.kind(), err.offset()), (ErrorKind::TrailingCharacters, 9));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    pub fn finish(&mut self) -> Result<Step<()>, Error> {
+        // A whole-value call left waiting is given up: its value is read
+        // as events, like the rest.
+        self.raw = None;
+        loop {
+            match self.next_event()? {
+                Step::Ready(Some(_)) => {}
+                Step::Ready(None) => return Ok(Step::Ready(())),
+                Step::NeedInput => return Ok(Step::NeedInput),
+            }
+        }
     }
 
     /// The kind of the next value, without consuming anything: `Ready(None)`
@@ -704,7 +793,12 @@ impl StreamReader {
         let mut progress = match self.raw {
             Some(progress) => progress,
             None => match self.machine.at_value(&self.buf) {
-                Ok(false) => return Ok(Step::Ready(None)),
+                Ok(false) => {
+                    return match self.machine.check_trailing(&self.buf) {
+                        Ok(()) => Ok(Step::Ready(None)),
+                        Err(e) => self.halt(e),
+                    };
+                }
                 Ok(true) => RawProgress {
                     depth: self.machine.depth(),
                     start: None,

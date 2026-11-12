@@ -14,11 +14,12 @@
 /// | Budget | Default | Counts |
 /// |---|---:|---|
 /// | [`max_depth`](Self::max_depth) | 128 | nested arrays and objects; a scalar at the top is depth 0, `[]` is 1 |
-/// | [`max_input_bytes`](Self::max_input_bytes) | 64 MiB | bytes of input |
+/// | [`max_input_bytes`](Self::max_input_bytes) | 64 MiB | bytes of input (of each document, for a stream of documents) |
 /// | [`max_string_bytes`](Self::max_string_bytes) | 16 MiB | source bytes between a string's quotes, keys included |
 /// | [`max_number_bytes`](Self::max_number_bytes) | 1 KiB | bytes of a number's text |
 /// | [`max_elements`](Self::max_elements) | 1 Mi | values in the document: every scalar, array, and object counts one |
 /// | [`max_memory`](Self::max_memory) | 64 MiB | heap one read call holds for what it builds: a tree, or a typed value (see below) |
+/// | [`max_value_bytes`](Self::max_value_bytes) | 64 MiB | bytes of input a [`StreamReader`](crate::StreamReader) holds for one value a whole-value call is waiting on |
 ///
 /// The depth default matches `serde_json`'s recursion limit, so code moving
 /// from it sees the same behaviour. A string's budget is measured in source
@@ -93,6 +94,13 @@ pub struct Limits {
     /// scalar document.
     pub max_depth: usize,
     /// The longest input accepted, in bytes.
+    ///
+    /// A [`StreamReader`](crate::StreamReader) in
+    /// [`documents`](crate::StreamReader::documents) mode applies it to each
+    /// document instead: the bytes fed since the current document began (or,
+    /// between documents, since the last one ended), so a long-lived stream
+    /// of documents is never refused for its total. Outside that mode it
+    /// bounds all the input, as for a complete document.
     pub max_input_bytes: usize,
     /// The longest string or key accepted, in source bytes between the quotes
     /// (escape sequences count at their written length).
@@ -105,6 +113,23 @@ pub struct Limits {
     /// The most heap, in bytes, one read call may hold for the tree or the
     /// typed value it builds; see "What a tree costs" above.
     pub max_memory: usize,
+    /// The most input, in bytes, a [`StreamReader`](crate::StreamReader)
+    /// holds for one value that a whole-value call
+    /// ([`read_raw`](crate::StreamReader::read_raw),
+    /// [`read_value`](crate::StreamReader::read_value),
+    /// [`decode`](crate::StreamReader::decode)) is waiting on: such a call
+    /// keeps the value's text, whitespace included, until the value ends.
+    /// Counted from the value's first byte; a [`feed`](crate::StreamReader::feed)
+    /// that would take it past this is refused with
+    /// [`ErrorKind::InputTooLarge`](crate::ErrorKind::InputTooLarge).
+    /// [`next_event`](crate::StreamReader::next_event) holds no value and is
+    /// not affected. The other readers have the whole input already and do
+    /// not use it.
+    ///
+    /// The default equals the default `max_input_bytes`. It matters when
+    /// `max_input_bytes` is raised for a long-lived stream: it still bounds
+    /// what one pending call can make the reader hold.
+    pub max_value_bytes: usize,
 }
 
 impl Limits {
@@ -129,6 +154,7 @@ impl Limits {
             max_number_bytes: 1024,
             max_elements: 1024 * 1024,
             max_memory: 64 * 1024 * 1024,
+            max_value_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -153,6 +179,7 @@ impl Limits {
             max_number_bytes: usize::MAX,
             max_elements: usize::MAX,
             max_memory: usize::MAX,
+            max_value_bytes: usize::MAX,
         }
     }
 
@@ -257,6 +284,27 @@ impl Limits {
         self.max_memory = bytes;
         self
     }
+
+    /// Sets [`max_value_bytes`](Self::max_value_bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonx_lib::{ErrorKind, Limits, Parser, Step};
+    ///
+    /// let limits = Limits::new().with_max_input_bytes(usize::MAX).with_max_value_bytes(8);
+    /// let mut r = Parser::new().limits(limits).stream_reader();
+    /// r.feed(b"[1, ")?;
+    /// assert_eq!(r.read_value()?, Step::NeedInput);
+    /// let err = r.feed(b"2, 3, 4]").unwrap_err();
+    /// assert_eq!((err.kind(), err.offset()), (ErrorKind::InputTooLarge, 8));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub const fn with_max_value_bytes(mut self, bytes: usize) -> Self {
+        self.max_value_bytes = bytes;
+        self
+    }
 }
 
 impl Default for Limits {
@@ -279,6 +327,7 @@ mod tests {
         assert_eq!(l.max_number_bytes, 1024);
         assert_eq!(l.max_elements, 1 << 20);
         assert_eq!(l.max_memory, 64 << 20);
+        assert_eq!(l.max_value_bytes, 64 << 20);
     }
 
     #[test]
@@ -289,7 +338,8 @@ mod tests {
             .with_max_string_bytes(3)
             .with_max_number_bytes(4)
             .with_max_elements(5)
-            .with_max_memory(6);
+            .with_max_memory(6)
+            .with_max_value_bytes(7);
         assert_eq!(
             (
                 l.max_depth,
@@ -297,9 +347,10 @@ mod tests {
                 l.max_string_bytes,
                 l.max_number_bytes,
                 l.max_elements,
-                l.max_memory
+                l.max_memory,
+                l.max_value_bytes
             ),
-            (1, 2, 3, 4, 5, 6)
+            (1, 2, 3, 4, 5, 6, 7)
         );
     }
 }

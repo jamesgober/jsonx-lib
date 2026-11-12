@@ -230,7 +230,11 @@ impl<'a> Reader<'a> {
     /// next (the current array or object ends, or the document already ended),
     /// returns `Ok(None)` and consumes nothing, so the next
     /// [`next_event`](Self::next_event) returns the end event as usual. Calling
-    /// it where a key comes next also returns `Ok(None)`.
+    /// it where a key comes next also returns `Ok(None)`. After a single
+    /// document's value, `Ok(None)` is returned only if nothing but
+    /// whitespace follows; anything else is
+    /// [`ErrorKind::TrailingCharacters`], as [`next_event`](Self::next_event)
+    /// and [`finish`](Self::finish) report it.
     ///
     /// The text is a slice of the input: it can be stored, compared, or parsed
     /// later, as `serde_json`'s `RawValue` is used. Nothing of the value is
@@ -242,7 +246,8 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// As [`next_event`](Self::next_event), for any error inside the value,
-    /// including a repeated key under [`DuplicateKeys::Error`].
+    /// including a repeated key under [`DuplicateKeys::Error`], and
+    /// [`ErrorKind::TrailingCharacters`] after the document.
     ///
     /// # Examples
     ///
@@ -262,7 +267,7 @@ impl<'a> Reader<'a> {
             return Err(e);
         }
         if !self.machine.at_value(self.src)? {
-            return Ok(None);
+            return self.no_value();
         }
         self.machine.skipping = true;
         let result = self.skip_value();
@@ -304,7 +309,7 @@ impl<'a> Reader<'a> {
             return Err(e);
         }
         if !self.machine.at_value(self.src)? {
-            return Ok(None);
+            return self.no_value();
         }
         let duplicates = self.machine.duplicates;
         self.begin_read();
@@ -366,9 +371,13 @@ impl<'a> Reader<'a> {
     /// document, as [`finish`](Self::finish) does), so
     /// `{"method": "a", "method": "b"}` is refused, as by
     /// [`parse`](crate::parse), rather than answered with either member. The
-    /// reader then stands past that value. Under the other policies it stops
-    /// just past the target, without reading the rest, and in an object the
-    /// first member with the key is the one taken.
+    /// reader then stands past that value. Under
+    /// [`DuplicateKeys::Last`] the member taken is the last one with the
+    /// key, as [`parse`](crate::parse) and typed reads under that policy
+    /// keep it: each object on the way is read to its end, and the reader
+    /// stands past the value it started on. Under the other policies it
+    /// stops just past the target, without reading the rest, and in an
+    /// object the first member with the key is the one taken.
     ///
     /// `Ok(None)` when the pointer is malformed or names nothing (as
     /// `Value::pointer`'s `None`).
@@ -397,7 +406,15 @@ impl<'a> Reader<'a> {
     pub fn find_pointer(&mut self, pointer: &str) -> Result<Option<&'a str>, Error> {
         let depth = self.depth();
         let found = self.find_in(pointer)?;
-        if self.machine.duplicates == DuplicateKeys::Error {
+        if self.machine.duplicates == DuplicateKeys::Last {
+            // The rest of the value it started on (each object on the way
+            // was read whole already).
+            while self.depth() > depth {
+                if self.next_event()?.is_none() {
+                    break;
+                }
+            }
+        } else if self.machine.duplicates == DuplicateKeys::Error {
             // The rest of the value, so that every object in it is checked.
             while self.depth() > depth {
                 if self.next_event()?.is_none() {
@@ -416,14 +433,37 @@ impl<'a> Reader<'a> {
         if pointer.is_empty() {
             return self.read_raw();
         }
-        let Some(rest) = pointer.strip_prefix('/') else {
-            return Ok(None);
-        };
-        for token in rest.split('/') {
+        match pointer.strip_prefix('/') {
+            Some(tokens) => self.find_tokens(tokens),
+            None => Ok(None),
+        }
+    }
+
+    /// [`find_in`](Self::find_in) for a pointer without its leading `/`.
+    fn find_tokens(&mut self, mut tokens: &str) -> Result<Option<&'a str>, Error> {
+        loop {
+            let (token, more) = match tokens.split_once('/') {
+                Some((token, more)) => (token, Some(more)),
+                None => (tokens, None),
+            };
             let Some(token) = crate::value::unescape_pointer_token(token) else {
                 return Ok(None);
             };
             match self.peek_kind()? {
+                Some(Kind::Object) if self.machine.duplicates == DuplicateKeys::Last => {
+                    let Some(member) = self.last_member(&token)? else {
+                        return Ok(None);
+                    };
+                    let Some(more) = more else {
+                        return Ok(Some(member));
+                    };
+                    // The rest of the pointer, in the member's text. It was
+                    // read and checked whole, so reading it again cannot
+                    // fail.
+                    let mut inner =
+                        Reader::with_config(member, self.machine.limits, DuplicateKeys::Last);
+                    return inner.find_tokens(more);
+                }
                 Some(Kind::Object) => {
                     let _start = self.next_event()?;
                     loop {
@@ -452,8 +492,26 @@ impl<'a> Reader<'a> {
                 }
                 _ => return Ok(None),
             }
+            match more {
+                Some(more) => tokens = more,
+                None => return self.read_raw(),
+            }
         }
-        self.read_raw()
+    }
+
+    /// Reads the object that comes next to its end and returns the text of
+    /// the last member with the key `key`, or `None` if it has none.
+    fn last_member(&mut self, key: &str) -> Result<Option<&'a str>, Error> {
+        let _start = self.next_event()?;
+        let mut found = None;
+        while let Some(Event::Key(name)) = self.next_event()? {
+            let hit = name == key;
+            let value = self.read_raw()?;
+            if hit {
+                found = value;
+            }
+        }
+        Ok(found)
     }
 
     /// Reads to the end of the document, checking that the rest of it is
@@ -476,6 +534,16 @@ impl<'a> Reader<'a> {
     /// ```
     pub fn finish(mut self) -> Result<(), Error> {
         self.read_to_end()
+    }
+
+    /// The answer of a whole-value read where no value comes next: `None`,
+    /// unless a single document's value is followed by more than
+    /// whitespace.
+    fn no_value<T>(&mut self) -> Result<Option<T>, Error> {
+        self.machine
+            .check_trailing(self.src)
+            .inspect_err(|&e| self.failed = Some(e))?;
+        Ok(None)
     }
 
     /// [`finish`](Self::finish) in place, for the crate's own one-call

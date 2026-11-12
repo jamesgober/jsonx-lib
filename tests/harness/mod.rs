@@ -25,6 +25,11 @@ const GRAMMAR_ONLY: Parser = Parser::new()
     .limits(Limits::unlimited())
     .duplicate_keys(DuplicateKeys::KeepAll);
 
+/// The grammar alone, with the last of repeated members kept.
+const LAST: Parser = Parser::new()
+    .limits(Limits::unlimited())
+    .duplicate_keys(DuplicateKeys::Last);
+
 /// Budgets small enough to be hit by short inputs.
 const TIGHT: Parser = Parser::new().limits(
     Limits::new()
@@ -157,6 +162,12 @@ pub fn check_reader(data: &[u8]) {
         let found = parser.reader(text).find_pointer(&pointer);
         if let (Ok(Some(raw)), Ok(v)) = (found, GRAMMAR_ONLY.parse(text)) {
             assert_eq!(GRAMMAR_ONLY.parse(raw).ok().as_ref(), v.pointer(&pointer));
+        }
+        // Under `Last`, the pointer finds what the tree keeps.
+        let found = LAST.reader(text).find_pointer(&pointer);
+        if let (Ok(found), Ok(v)) = (found, LAST.parse(text)) {
+            let found = found.map(|raw| LAST.parse(raw).unwrap());
+            assert_eq!(found.as_ref(), v.pointer(&pointer), "{pointer}");
         }
         // Document sequences never panic, and each document read is valid.
         let mut docs = parser.reader(text).documents();

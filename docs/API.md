@@ -1,7 +1,7 @@
 # jsonx-lib &mdash; API Reference
 
 > Complete reference for every public item in `jsonx-lib`, with examples.
-> **Status: 0.5.1, pre-1.0.** The surface is designed across the 0.x series
+> **Status: 0.5.2, pre-1.0.** The surface is designed across the 0.x series
 > and frozen at `1.0.0`, after lsp-lang and the LexerSketch API have used it.
 > See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -338,7 +338,11 @@ pub fn to_string_pretty<T: ToJson + ?Sized>(value: &T) -> String
 ```
 
 Indented JSON: two spaces per level, one member or item per line, `": "`
-after keys, `[]` and `{}` for empty containers, no trailing newline.
+after keys, `[]` and `{}` for empty containers, no trailing newline. The
+indentation grows with the square of the nesting depth (about `2 * depth *
+depth` bytes); under the default limits a parsed value is at most 128 levels
+deep, but a value parsed with `Limits::unlimited()` or built in code may be
+too deep for its pretty text to fit in memory. Write such a value compactly.
 
 ```rust
 let v = jsonx_lib::json!({ "a": [1], "b": {} });
@@ -405,17 +409,19 @@ pub struct Limits {
     pub max_number_bytes: usize,
     pub max_elements: usize,
     pub max_memory: usize,
+    pub max_value_bytes: usize,
 }
 ```
 
 | Budget | Default | Counts | Error |
 |---|---:|---|---|
 | `max_depth` | 128 | nested arrays and objects; a scalar document is depth 0, `[]` is 1 | `DepthLimitExceeded` at the bracket that went too deep |
-| `max_input_bytes` | 64 MiB | bytes of input (for a `StreamReader`, all bytes fed) | `InputTooLarge` at the limit |
+| `max_input_bytes` | 64 MiB | bytes of input (for a `StreamReader`, all bytes fed; in its documents mode, the bytes of each document) | `InputTooLarge` at the first byte over it |
 | `max_string_bytes` | 16 MiB | source bytes between a string's quotes, keys included (an escape counts at its written length) | `StringTooLong` at the opening quote |
 | `max_number_bytes` | 1 KiB | bytes of a number's text | `NumberTooLong` at the number's first byte |
 | `max_elements` | 1 Mi | values: every scalar, array, and object counts one; keys do not. Per document in a sequence | `TooManyElements` at the value that went over |
 | `max_memory` | 64 MiB | heap one read call holds: a parse's or `read_value`'s tree and working stacks, or a typed decode's value (see [Budgets](#budgets)) | `MemoryLimitExceeded` at the value whose storage went over |
+| `max_value_bytes` | 64 MiB | bytes of input a `StreamReader` holds for one value that `read_raw`, `read_value`, or `decode` is waiting on, from the value's first byte | `InputTooLarge` at the first byte over it |
 
 The depth default matches `serde_json`'s recursion limit. `max_memory`
 counts buffers at their capacity, checked before a stack grows (the moment
@@ -430,7 +436,7 @@ through `FromJson`). `#[non_exhaustive]`: start from `Limits::new()` or
 |---|---|
 | `const fn new() -> Limits` / `Default` | The defaults above. |
 | `const fn unlimited() -> Limits` | Every budget `usize::MAX`, for trusted input (still no stack risk). |
-| `const fn with_max_depth(self, usize)`, `with_max_input_bytes`, `with_max_string_bytes`, `with_max_number_bytes`, `with_max_elements`, `with_max_memory` | Set one budget. |
+| `const fn with_max_depth(self, usize)`, `with_max_input_bytes`, `with_max_string_bytes`, `with_max_number_bytes`, `with_max_elements`, `with_max_memory`, `with_max_value_bytes` | Set one budget. |
 
 ```rust
 use jsonx_lib::{ErrorKind, Limits, Parser};
@@ -524,7 +530,7 @@ error, and the iterator yields it once and then ends.
 | `fn read_object(&mut self) -> Result<ObjectReader<'_, 'a>, DecodeError>` | Starts reading an object member by member ([`ObjectReader`](#objectreader)). |
 | `fn read_array(&mut self) -> Result<ArrayReader<'_, 'a>, DecodeError>` | Starts reading an array item by item ([`ArrayReader`](#arrayreader)). |
 | `fn peek_kind(&mut self) -> Result<Option<Kind>, Error>` | The next value's kind, from its first byte, consuming nothing. |
-| `fn find_pointer(&mut self, &str) -> Result<Option<&'a str>, Error>` | The raw text of the value at a JSON Pointer, building no tree. Under `DuplicateKeys::Error` (the default) it reads the rest of the value (at the top, the rest of the document) first, so a document with a repeated key anywhere is refused rather than answered; under the other policies it reads only as far as the target, taking an object's first member with the key. |
+| `fn find_pointer(&mut self, &str) -> Result<Option<&'a str>, Error>` | The raw text of the value at a JSON Pointer, building no tree. Under `DuplicateKeys::Error` (the default) it reads the rest of the value (at the top, the rest of the document) first, so a document with a repeated key anywhere is refused rather than answered. Under `DuplicateKeys::Last` it takes an object's last member with the key, as `parse` does under that policy, reading each object on the way to its end and the rest of the value it started on. Under the other policies it reads only as far as the target, taking an object's first member with the key. |
 | `fn finish(self) -> Result<(), Error>` | Reads and validates the rest of the document. |
 | `fn depth(&self)`, `fn offset(&self)`, `fn event_offset(&self)` | Containers open; bytes consumed; where the last event's token began. |
 
@@ -533,7 +539,9 @@ error, and the iterator yields it once and then ends.
 `Key`, or between array items. When no value comes next (the current
 container ends, the document has ended, or a key comes next), the
 `Option`-returning ones return `Ok(None)` and consume nothing, so the next
-`next_event` returns the end event or the key as usual.
+`next_event` returns the end event or the key as usual. After a single
+document's value they return `Ok(None)` only if nothing but whitespace
+follows; anything else is `TrailingCharacters`, as `next_event` reports it.
 
 ```rust
 use jsonx_lib::{Event, Reader};
@@ -616,6 +624,14 @@ continues where it stopped, so a string fed one byte at a time costs linear
 time. Invalid UTF-8 is reported when the reader reaches it (a syntax error
 before it comes first).
 
+`next_event` reads in constant memory: one token and one chunk. The
+whole-value calls (`read_raw`, `read_value`, `decode`) keep their value's
+text, whitespace included, in the buffer until the value ends, bounded by
+`Limits::max_value_bytes`. In documents mode `max_input_bytes` applies to
+each document (counted from where it began, or between documents from the
+end of the last one), so a long-lived NDJSON connection is never refused for
+its total.
+
 Events borrow the reader's buffer: drop each before the next call, and feed
 after the borrow ends (`if let Step::Ready(e) = r.next_event()? { ... } else
 { r.feed(...)?; }` on Rust 2024, whose `if let` drops its temporaries before
@@ -625,7 +641,7 @@ the `else`; a `match` keeps the borrow in every arm).
 |---|---|
 | `fn new() -> StreamReader` / `Default` | Default limits; [`Parser::stream_reader`](#parser) for others. |
 | `fn documents(self) -> StreamReader` | Read a sequence of documents. |
-| `fn feed(&mut self, &[u8]) -> Result<(), Error>` | Adds input. `InputTooLarge` over `max_input_bytes` in total; `InputAfterEnd` after `end_input`. |
+| `fn feed(&mut self, &[u8]) -> Result<(), Error>` | Adds input. `InputTooLarge` over `max_input_bytes` in total (in documents mode, for the current document) or over `max_value_bytes` for a value a whole-value call is waiting on; `InputAfterEnd` after `end_input`. |
 | `fn end_input(&mut self)` | Nothing more will be fed. |
 | `fn read_from(&mut self, &mut dyn io::Read) -> io::Result<usize>` | (`std`) Reads up to 8 KiB and feeds it; at the source's end, ends the input. |
 | `fn next_event(&mut self) -> Result<Step<Option<Event<'_>>>, Error>` | As `Reader::next_event`. |
@@ -633,6 +649,7 @@ the `else`; a `match` keeps the borrow in every arm).
 | `fn read_value(&mut self) -> Result<Step<Option<Value<'_>>>, Error>` | As `Reader::read_value`. |
 | `fn decode<'s, T: FromJson<'s>>(&'s mut self) -> Result<Step<Option<T>>, DecodeError>` | The next value as a `T`. |
 | `fn peek_kind(&mut self) -> Result<Step<Option<Kind>>, Error>` | As `Reader::peek_kind`. |
+| `fn finish(&mut self) -> Result<Step<()>, Error>` | As `Reader::finish`: reads the rest of the input, checking that it is valid and that nothing but whitespace follows; `Ready(())` once the input has ended. Call it after the whole-value calls to know that the input held exactly one document. |
 | `fn depth(&self)`, `fn offset(&self)`, `fn event_offset(&self)`, `fn buffered(&self)` | As on `Reader`; and the bytes held. |
 | `Step::ready(self) -> Option<T>`, `Step::is_ready(&self)`, `Step::map(self, f)` | Helpers. |
 
@@ -835,7 +852,7 @@ pub enum PathSegment { Key(String), Index(usize) }
 | `fn pointer(&self) -> String` | The path as an RFC 6901 JSON Pointer. |
 | `fn line_col(&self, input)`, `fn utf16_position(&self, input)` | As on [`Error`](#error). |
 | `fn syntax_error(&self) -> Option<Error>` | The parse error, for `Syntax`. |
-| `From<Error>`, `Display` (`"<what> at byte N (at /path)"`), `core::error::Error` | |
+| `From<Error>`, `Display` (`"<what> at byte N (at /path)"`), `core::error::Error` | `Display` shows the path's keys safe to log: control characters, line and paragraph separators, and bidirectional formatting characters escaped (`\u{a}`), backslashes doubled, and each key cut at 64 characters with `...`. `path` and `pointer` stay exact. |
 
 ```rust
 use jsonx_lib::{DecodeErrorKind, Kind, PathSegment};
@@ -914,7 +931,7 @@ V>`, (`std`) `HashMap<K, V, S>` (keys through [`ToJsonKey`](#tojsonkey); a
 | `f64`, `f32` | Shortest round-trip text (`1.0`, `0.1`); NaN and the infinities as `null`. |
 | `number(&Number)` | The number's exact text. |
 | `str(&str)` | The string, escaped. |
-| `raw(&RawValue)` | The raw text: unchanged in the plain formats; under `html_safe` / `ascii`, with those characters escaped inside its strings. |
+| `raw(&RawValue)` | The raw text: unchanged in the plain formats (U+2028 and U+2029 inside its strings included, which `write_string` escapes); under `html_safe` / `ascii`, with those characters escaped inside its strings. |
 | `value(&Value)` | A value, iteratively, in the writer's layout. |
 | `json(&T)` | `T`'s own `ToJson`. |
 | `object(impl FnOnce(&mut ObjectWriter<'_>))`, `array(impl FnOnce(&mut ArrayWriter<'_>))` | A container built in the closure. |
@@ -984,17 +1001,20 @@ assert_eq!(edit.range[1].character, 3);
 pub struct RawValue<'a> { /* Cow<'a, str> */ }
 ```
 
-One complete JSON value kept as its exact text, with no whitespace around it:
-validated once, then stored, forwarded, or read later (`serde_json`'s
+One complete JSON value kept as its exact text, with no whitespace around
+it: validated once, then stored, forwarded, or read later (`serde_json`'s
 `RawValue`). Every way of making one validates or takes text this crate has
 just validated or written, so writing one copies the text with no second
-check and the output stays valid JSON. The strict [`Format`](#format)s
-apply to it too: under `html_safe` or `ascii` the characters they escape
-are escaped inside the raw text's strings, so `</script>` in a forwarded
-result cannot reach a page that asked for HTML-safe output. Valid means
-grammatical: a `RawValue` read under `KeepAll`, or encoded from a `ToJson`
-that writes a key twice, can hold a repeated key, which `decode` (default
-policy) refuses and `parse` keeps.
+check and the output stays valid JSON. The plain formats copy it as it is,
+so U+2028 and U+2029 inside its strings stay raw there, where every string
+the writers make has them escaped; for output pasted into JavaScript source,
+use `html_safe`. The strict [`Format`](#format)s apply to it too: under
+`html_safe` or `ascii` the characters they escape are escaped inside the raw
+text's strings, so `</script>` in a forwarded result cannot reach a page
+that asked for HTML-safe output. Valid means grammatical: a `RawValue` read
+under `KeepAll`, or encoded from a `ToJson` that writes a key twice, can
+hold a repeated key, which `decode` (default policy) refuses and `parse`
+keeps.
 
 | Item | Description |
 |---|---|
@@ -1178,7 +1198,7 @@ iterate it instead of looking each key up.
 | `fn len(&self)`, `fn is_empty(&self)` | Size. |
 | `fn get(&self, &str) -> Option<&Value<'a>>` / `get_mut` | The first member named so. |
 | `fn contains_key(&self, &str) -> bool` | Whether a member is named so. |
-| `fn insert(&mut self, key, value) -> Option<Value<'a>>` | Map semantics: replaces in place and returns the old value, or appends. |
+| `fn insert(&mut self, key, value) -> Option<Value<'a>>` | Map semantics: replaces in place and returns the old value, or appends. The lookup is a linear scan, so building a large object with `insert` is quadratic; `push` or `collect` appends without it. |
 | `fn push(&mut self, key, value)` | Appends without looking (constant time; duplicates possible). |
 | `fn remove(&mut self, &str) -> Option<Value<'a>>` | Removes the first member named so; order kept. |
 | `fn retain(&mut self, FnMut(&str, &mut Value) -> bool)` | Keeps the members the closure says to. |
