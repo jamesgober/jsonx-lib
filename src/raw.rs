@@ -27,7 +27,9 @@ use crate::{
 /// [`Format::ascii`](crate::Format::ascii) the characters those formats
 /// escape are escaped inside the text's strings as well (see
 /// [`ValueWriter::raw`](crate::ValueWriter::raw)); otherwise the text is
-/// copied unchanged.
+/// copied unchanged, U+2028 and U+2029 inside its strings included (the
+/// strings the writers make have them escaped; for raw text, use
+/// `html_safe` where that matters).
 ///
 /// Valid means grammatical JSON. A `RawValue` taken under
 /// [`DuplicateKeys::KeepAll`](crate::DuplicateKeys::KeepAll), or made by

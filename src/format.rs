@@ -16,7 +16,12 @@
 ///   (a surrogate pair above U+FFFF), for channels that are not 8-bit clean.
 ///
 /// Both apply to everything written, [`RawValue`](crate::RawValue) text
-/// included (its strings are escaped the same way).
+/// included (its strings are escaped the same way). The plain formats
+/// copy a `RawValue`'s text as it is, so U+2028 and U+2029 inside its
+/// strings are written raw there (valid JSON, but not JavaScript source
+/// before ES2019); every string the writers make has them escaped. For
+/// output pasted into JavaScript, use `html_safe`, which escapes them in
+/// raw text too.
 ///
 /// Two options change the text of floats written from Rust values
 /// ([`ValueWriter::f64`](crate::ValueWriter::f64) and

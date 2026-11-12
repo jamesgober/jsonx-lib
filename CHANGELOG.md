@@ -13,6 +13,82 @@
 
 ---
 
+## [0.5.2] - 2026-11-12
+
+Fixes in the readers: a stream of documents is budgeted per document, the
+buffer behind the stream reader's whole-value calls has its own bound, the
+whole-value calls refuse input after a single document, and pointer lookups
+under `DuplicateKeys::Last` take the member that `parse` keeps. Typed-decode
+error messages are safe to log.
+
+### Added
+
+- `Limits::max_value_bytes` (default 64 MiB) and `Limits::with_max_value_bytes`:
+  the most input a `StreamReader` holds for one value that `read_raw`,
+  `read_value`, or `decode` is waiting on, counted from the value's first
+  byte. A `feed` past it is refused with `ErrorKind::InputTooLarge` at the
+  first byte over the budget. `next_event` holds no value and is not
+  affected. `Limits` is `#[non_exhaustive]`, so adding the field is not a
+  breaking change.
+- `StreamReader::finish`: reads the rest of the input, checking that it is
+  valid and that nothing but whitespace follows the document (or, in
+  documents mode, the last document). `Ready(())` once the input has ended,
+  `NeedInput` before that; as `Reader::finish` for input that arrives in
+  pieces.
+
+### Fixed
+
+- **`StreamReader` in documents mode** counted `max_input_bytes` over the
+  whole life of the stream, so a long-lived NDJSON feed was refused after
+  64 MiB in total however small its documents. The budget now applies to
+  each document: the bytes fed since the current document began (or, between
+  documents, since the last one ended). Outside documents mode it still
+  bounds all the input. `InputTooLarge` is reported at the offset of the
+  first byte over the budget (unchanged outside documents mode).
+- **The buffer behind `StreamReader::read_raw`, `read_value`, and `decode`**
+  was bounded only by `max_input_bytes`, so with that raised for a
+  long-lived stream one value padded with whitespace could grow the buffer
+  without limit. It is now bounded by `max_value_bytes` as well.
+- **Input after a single document's value.** `Reader::read_raw` and
+  `read_value`, and `StreamReader::read_raw`, `read_value`, and `decode`,
+  answered "no value comes next" at the end of a document whatever followed
+  it, so a loop that read until that answer accepted `7 8` or `{"a":1}}`,
+  which `parse` and `from_str` refuse. They now report
+  `ErrorKind::TrailingCharacters` at the first byte that is not whitespace,
+  as `next_event` does; a stream reader that has seen only whitespace after
+  the document answers `NeedInput` until the input ends, as `next_event`
+  does there, and then `Ready(None)`. Documents mode is unchanged.
+- **`Reader::find_pointer` under `DuplicateKeys::Last`** took an object's
+  first member with the key, while `parse` and typed reads under that policy
+  keep the last, so one document could give two answers. It now takes the
+  last member: each object on the way is read to its end, and the reader
+  stands past the value it started on. Errors anywhere in those objects are
+  now reported. `First` and `KeepAll` are unchanged.
+- **`DecodeError`'s `Display`** printed the path's keys as they were in the
+  input, so a key holding a newline could forge a log line, and a 16 MiB key
+  made a 16 MiB message. The message now writes control characters, line and
+  paragraph separators, and bidirectional formatting characters as Rust
+  escapes (`\u{a}`), doubles backslashes, and cuts each key at 64
+  characters with `...`. `path()` and `pointer()` are unchanged and exact.
+
+### Documentation
+
+- `StreamReader`: `next_event` reads in constant memory; the whole-value
+  calls keep their value in the buffer until it ends. The whole-value calls
+  do not prove the input is over: use `finish` for that.
+- `to_string_pretty`: the output grows with the square of the nesting depth;
+  write a very deeply nested value compactly.
+- `Format`, `ValueWriter::raw`, `RawValue`: the plain formats copy raw text
+  as it is, U+2028 and U+2029 inside its strings included; `html_safe`
+  escapes them.
+- `Object::insert` and `Object::entry` find the member by a linear scan, so
+  building a large object with `insert` is quadratic; `push` and `collect`
+  append without it.
+- README: the typed-decoding comparison now says that it takes 2.3 to 2.6
+  times as long as `serde_json`'s derive.
+
+---
+
 ## [0.5.1] - 2026-11-05
 
 Faster writing, the same bytes: floats are formatted in house instead of
@@ -305,7 +381,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/jamesgober/jsonx-lib/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jamesgober/jsonx-lib/compare/v0.2.0...v0.5.0
 [0.2.0]: https://github.com/jamesgober/jsonx-lib/compare/v0.1.0...v0.2.0
