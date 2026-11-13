@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, zero dependencies.
     </p>
     <blockquote>
-        <strong>Status: 0.5.1, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, once lsp-lang and the LexerSketch API have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
+        <strong>Status: 0.5.1, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, once lsp-lang and the toolchain's API have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
     </blockquote>
 </div>
 
