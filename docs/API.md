@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `jsonx-lib`, with examples.
 > **Status: 0.5.2, pre-1.0.** The surface is designed across the 0.x series
-> and frozen at `1.0.0`, after lsp-lang and the LexerSketch API have used it.
+> and frozen at `1.0.0`, after lsp-lang and the toolchain's API have used it.
 > See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
@@ -1528,5 +1528,5 @@ The serde_json features a language server leans on, and their counterparts:
 
 Pre-1.0. The surface above may change in a 0.x minor release, recorded in the
 CHANGELOG with a migration note. It is frozen at `1.0.0` after a real
-consumer (lsp-lang, then the LexerSketch API) has exercised it end to end.
+consumer (lsp-lang, then the toolchain's API) has exercised it end to end.
 MSRV 1.85; raising it is a minor release.

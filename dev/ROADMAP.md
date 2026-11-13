@@ -1,7 +1,6 @@
 # jsonx-lib - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: C:/Dev/libraries/Rust/lang-collection/_lexersketch/ROADMAP.md and NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -222,4 +221,4 @@ Decided (anti-deferral rule):
 - [ ] Allocation profile of the tree build (an arena or inline storage, moved from 0.5).
 
 ## v1.0.0 - Stable
-- [ ] Frozen after lsp-lang and the LexerSketch API use it (D18).
+- [ ] Frozen after lsp-lang and the toolchain's API use it (D18).

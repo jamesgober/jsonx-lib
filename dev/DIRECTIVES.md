@@ -1,13 +1,12 @@
 # jsonx-lib &mdash; Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> LexerSketch plan: `C:/Dev/libraries/Rust/lang-collection/_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is a single-purpose `-lib` in the owner's lib-collection, used across the portfolio (LexerSketch's LSP, DAP, MCP, and emitters first).
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is a single-purpose `-lib` in the owner's lib-collection, used across the portfolio (the toolchain's LSP, DAP, MCP, and emitters first).
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 jsonx-lib owns JSON text: a tokenizer, a borrowing document model, a streaming reader and writer, and exact escaping. It does not map JSON onto user types by reflection; typed access is explicit.
 
-LexerSketch's LSP, DAP, MCP servers and its emitters all speak JSON, and the family's rule is no rented runtime dependencies (lsp-lang currently rents serde_json; ISSUES M76).
+The toolchain's LSP, DAP, MCP servers and its emitters all speak JSON, and the family's rule is no rented runtime dependencies (lsp-lang currently rents serde_json; ISSUES M76).
 
 ---
 
@@ -42,7 +41,7 @@ LexerSketch's LSP, DAP, MCP servers and its emitters all speak JSON, and the fam
 6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 
